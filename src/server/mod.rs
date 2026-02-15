@@ -46,17 +46,26 @@ pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
         None
     };
 
-    // Set up PTY if requested
-    let pty_info = if config.pty {
-        let (master_fd, slave_path) = pty_bridge::create_pty()?;
-        tracing::info!("PTY slave: {slave_path}");
+    // Set up PTY if requested. Spawns a child process that owns the PTY
+    // master/slave and communicates with the parent via a socketpair.
+    let pty_child = if config.pty {
+        let child = pty_bridge::spawn_pty_child()?;
+        tracing::info!("PTY slave: {} (child pid {})", child.slave_path, child.child_pid);
 
+        // Always create a stable symlink in the runtime dir (like smux)
+        let default_link = crate::runtime::pty_path(&config.name);
+        pty_bridge::create_pty_symlink(&child.slave_path, &default_link)?;
+        eprintln!("PTY: {}", default_link.display());
+        tracing::info!("PTY symlink: {}", default_link.display());
+
+        // Create an additional user-specified symlink if requested
         if let Some(ref link) = config.pty_link {
-            pty_bridge::create_pty_symlink(&slave_path, link)?;
-            tracing::info!("PTY symlink: {}", link.display());
+            pty_bridge::create_pty_symlink(&child.slave_path, link)?;
+            eprintln!("PTY symlink: {}", link.display());
+            tracing::info!("PTY extra symlink: {}", link.display());
         }
 
-        Some((master_fd, slave_path))
+        Some(child)
     } else {
         None
     };
@@ -75,7 +84,7 @@ pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
         baudrate: config.baudrate,
         socket: socket_path.to_string_lossy().into_owned(),
         log_file: log_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
-        pty_device: pty_info.as_ref().map(|(_, path)| path.clone()),
+        pty_device: pty_child.as_ref().map(|c| c.slave_path.clone()),
         started_at: chrono::Local::now().to_rfc3339(),
     };
     state::write_state_file(&state)?;
@@ -159,19 +168,25 @@ pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
         });
     }
 
-    // Spawn PTY bridge if enabled
-    if let Some((master_fd, _slave_path)) = pty_info {
+    // Spawn PTY bridge if enabled. The child process owns the PTY master/slave;
+    // we only need to shuttle data over the socketpair.
+    let pty_child_pid = if let Some(child) = pty_child {
+        let pid = child.child_pid;
         let pty_rx = broadcast_tx.subscribe();
         let pty_serial_tx = serial_tx.clone();
         let pty_cancel = cancel.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                pty_bridge::run_pty_bridge(master_fd, pty_rx, pty_serial_tx, pty_cancel).await
+                pty_bridge::run_pty_bridge_socket(child.socket, pty_rx, pty_serial_tx, pty_cancel)
+                    .await
             {
                 tracing::error!("PTY bridge error: {e}");
             }
         });
-    }
+        Some(pid)
+    } else {
+        None
+    };
 
     // Spawn interactive console if requested
     if config.interactive {
@@ -219,6 +234,13 @@ pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
 
     // Cleanup
     tracing::info!("server shutting down");
+    if let Some(pid) = pty_child_pid {
+        tracing::info!("terminating PTY child process {pid}");
+        pty_bridge::kill_pty_child(pid);
+    }
+    if config.pty {
+        let _ = std::fs::remove_file(crate::runtime::pty_path(&config.name));
+    }
     if let Some(ref link) = config.pty_link {
         let _ = std::fs::remove_file(link);
     }
