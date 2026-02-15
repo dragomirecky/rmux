@@ -23,10 +23,14 @@ pub async fn run_client(args: ClientArgs) -> anyhow::Result<()> {
     tracing::info!("connected to server '{}'", args.name);
 
     // Compute timestamps flag early so history display can use it
-    let timestamps = args.timestamps.unwrap_or_else(|| {
+    let timestamps = if args.timestamps {
+        true
+    } else if args.no_timestamps {
+        false
+    } else {
         // Auto-detect: timestamps if piped, no timestamps if TTY
         !std::io::stdout().is_terminal()
-    });
+    };
 
     // Show history from log file if requested
     if let Some(n) = args.history {
@@ -62,9 +66,12 @@ pub async fn run_client(args: ClientArgs) -> anyhow::Result<()> {
     }
 
     // Determine mode
-    let is_command_mode = args.send.is_some() || args.collect.is_some() || args.wait_for.is_some();
-    let is_interactive = if let Some(i) = args.interactive {
-        i
+    let is_command_mode =
+        args.command.is_some() || args.timeout.is_some() || args.wait_for.is_some();
+    let is_interactive = if args.interactive {
+        true
+    } else if args.no_interactive {
+        false
     } else {
         !is_command_mode && std::io::stdout().is_terminal()
     };
@@ -74,8 +81,8 @@ pub async fn run_client(args: ClientArgs) -> anyhow::Result<()> {
     } else {
         let output = command::run_command(
             &mut stream,
-            args.send.as_deref(),
-            args.collect,
+            args.command.as_deref(),
+            args.timeout,
             args.wait_for.as_deref(),
             timestamps,
         )

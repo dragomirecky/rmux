@@ -35,10 +35,10 @@ fn main() -> anyhow::Result<()> {
                 baudrate: args.baudrate,
                 log: args.log,
                 log_dir: args.log_dir,
-                interactive: args.interactive,
+                interactive: !args.no_interactive,
                 pty: args.pty,
                 pty_link: args.pty_link,
-                reconnect: args.reconnect,
+                reconnect: !args.no_reconnect,
                 socket_path: None,
             };
             let rt = tokio::runtime::Runtime::new()?;
