@@ -21,9 +21,13 @@ pub async fn run_command(
     // Optionally request history first
     // (handled at a higher level if --history is set)
 
-    // Send data if specified
+    // Send data if specified, appending a newline if not already present
     if let Some(data) = send {
-        let encoded = encode_data(data.as_bytes());
+        let mut bytes = data.as_bytes().to_vec();
+        if !bytes.ends_with(b"\n") && !bytes.ends_with(b"\r") && !bytes.ends_with(b"\r\n") {
+            bytes.push(b'\n');
+        }
+        let encoded = encode_data(&bytes);
         stream.write_all(&encoded).await?;
     }
 

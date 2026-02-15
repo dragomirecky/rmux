@@ -33,7 +33,7 @@ fn main() -> anyhow::Result<()> {
                 name: args.name,
                 port: args.port,
                 baudrate: args.baudrate,
-                log: args.log,
+                log: !args.no_log,
                 log_dir: args.log_dir,
                 interactive: !args.no_interactive,
                 pty: args.pty,

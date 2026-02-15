@@ -37,9 +37,9 @@ pub struct ServerArgs {
     #[arg(short, long, default_value_t = 115_200)]
     pub baudrate: u32,
 
-    /// Enable logging to file
+    /// Disable logging to file (logging enabled by default)
     #[arg(long, default_value_t = false)]
-    pub log: bool,
+    pub no_log: bool,
 
     /// Directory for log files (default: runtime dir)
     #[arg(long)]
@@ -120,7 +120,7 @@ mod tests {
                 assert_eq!(args.name, "test1");
                 assert_eq!(args.port, "/dev/ttyUSB0");
                 assert_eq!(args.baudrate, 115_200);
-                assert!(!args.log);
+                assert!(!args.no_log);
                 assert!(!args.no_interactive);
                 assert!(!args.pty);
                 assert!(!args.no_reconnect);
@@ -139,7 +139,7 @@ mod tests {
             "/dev/ttyACM0",
             "-b",
             "9600",
-            "--log",
+            "--no-log",
             "--log-dir",
             "/var/log/rmux",
             "--no-interactive",
@@ -153,7 +153,7 @@ mod tests {
                 assert_eq!(args.name, "dev1");
                 assert_eq!(args.port, "/dev/ttyACM0");
                 assert_eq!(args.baudrate, 9600);
-                assert!(args.log);
+                assert!(args.no_log);
                 assert_eq!(
                     args.log_dir,
                     Some(PathBuf::from("/var/log/rmux"))
