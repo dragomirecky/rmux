@@ -25,6 +25,11 @@ pub fn log_path(name: &str) -> PathBuf {
     runtime_dir().join(format!("{name}.log"))
 }
 
+/// Path to the PTY symlink for a given server name.
+pub fn pty_path(name: &str) -> PathBuf {
+    runtime_dir().join(format!("{name}.pty"))
+}
+
 /// Ensure the runtime directory exists.
 pub fn ensure_runtime_dir() -> std::io::Result<()> {
     std::fs::create_dir_all(runtime_dir())
