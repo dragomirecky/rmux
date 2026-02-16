@@ -76,11 +76,18 @@ pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
         .clone()
         .unwrap_or_else(|| crate::runtime::socket_path(&config.name));
 
+    // Determine display label for the transport
+    let transport_label = if let Some(ref addr) = config.tcp {
+        format!("tcp://{addr}")
+    } else {
+        config.port.clone().unwrap_or_default()
+    };
+
     // Write state file
     let state = ServerStateFile {
         name: config.name.clone(),
         pid: std::process::id(),
-        port: config.port.clone(),
+        port: transport_label.clone(),
         baudrate: config.baudrate,
         socket: socket_path.to_string_lossy().into_owned(),
         log_file: log_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
@@ -96,62 +103,106 @@ pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
 
     // Shared client context
     let ctx = Arc::new(ClientContext {
-        port: config.port.clone(),
+        port: transport_label,
         baudrate: config.baudrate,
         serial_connected: true,
         client_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     });
 
-    // Open serial port once and split for reader/writer
-    let serial_cancel = cancel.clone();
-    let serial_broadcast_tx = broadcast_tx.clone();
-    let serial_port = config.port.clone();
-    let serial_baudrate = config.baudrate;
-    let serial_reconnect = config.reconnect;
+    // Open transport and split for reader/writer
+    let transport_cancel = cancel.clone();
+    let transport_broadcast_tx = broadcast_tx.clone();
+    let transport_reconnect = config.reconnect;
 
-    match serial::open_serial(&serial_port, serial_baudrate) {
-        Ok(serial_stream) => {
-            let (read_half, write_half) = tokio::io::split(serial_stream);
+    if let Some(ref tcp_addr) = config.tcp {
+        // TCP transport
+        let addr = tcp_addr.clone();
+        match serial::open_tcp(&addr).await {
+            Ok(tcp_stream) => {
+                let (read_half, write_half) = tokio::io::split(tcp_stream);
 
-            // Spawn serial reader
-            let reader_cancel = serial_cancel.clone();
-            tokio::spawn(async move {
-                serial::run_serial_reader(read_half, serial_broadcast_tx, reader_cancel).await;
-            });
+                let reader_cancel = transport_cancel.clone();
+                tokio::spawn(async move {
+                    serial::run_serial_reader(read_half, transport_broadcast_tx, reader_cancel).await;
+                });
 
-            // Spawn serial writer
-            let writer_cancel = serial_cancel;
-            tokio::spawn(async move {
-                serial::run_serial_writer(write_half, serial_rx, writer_cancel).await;
-            });
+                let writer_cancel = transport_cancel;
+                tokio::spawn(async move {
+                    serial::run_serial_writer(write_half, serial_rx, writer_cancel).await;
+                });
+            }
+            Err(e) => {
+                tracing::error!("failed to connect to TCP {}: {e}", addr);
+                if transport_reconnect {
+                    tokio::spawn(async move {
+                        serial::run_tcp_reader_reconnect(
+                            addr,
+                            transport_broadcast_tx,
+                            transport_reconnect,
+                            transport_cancel,
+                        )
+                        .await;
+                    });
+                    let writer_cancel = cancel.clone();
+                    tokio::spawn(async move {
+                        drop(serial_rx);
+                        writer_cancel.cancelled().await;
+                    });
+                } else {
+                    tracing::warn!("TCP connection unavailable, client writes disabled");
+                    let writer_cancel = cancel.clone();
+                    tokio::spawn(async move {
+                        drop(serial_rx);
+                        writer_cancel.cancelled().await;
+                    });
+                }
+            }
         }
-        Err(e) => {
-            tracing::error!("failed to open serial port {}: {e}", serial_port);
-            if serial_reconnect {
-                // Fall back to reconnection mode for the reader
+    } else {
+        // Serial transport
+        let serial_port = config.port.clone().unwrap_or_default();
+        let serial_baudrate = config.baudrate;
+
+        match serial::open_serial(&serial_port, serial_baudrate) {
+            Ok(serial_stream) => {
+                let (read_half, write_half) = tokio::io::split(serial_stream);
+
+                let reader_cancel = transport_cancel.clone();
                 tokio::spawn(async move {
-                    serial::run_serial_reader_reconnect(
-                        serial_port,
-                        serial_baudrate,
-                        serial_broadcast_tx,
-                        serial_reconnect,
-                        serial_cancel,
-                    )
-                    .await;
+                    serial::run_serial_reader(read_half, transport_broadcast_tx, reader_cancel).await;
                 });
-                // Keep serial_rx alive so senders don't error
-                let writer_cancel = cancel.clone();
+
+                let writer_cancel = transport_cancel;
                 tokio::spawn(async move {
-                    drop(serial_rx);
-                    writer_cancel.cancelled().await;
+                    serial::run_serial_writer(write_half, serial_rx, writer_cancel).await;
                 });
-            } else {
-                tracing::warn!("serial port unavailable, client writes disabled");
-                let writer_cancel = cancel.clone();
-                tokio::spawn(async move {
-                    drop(serial_rx);
-                    writer_cancel.cancelled().await;
-                });
+            }
+            Err(e) => {
+                tracing::error!("failed to open serial port {}: {e}", serial_port);
+                if transport_reconnect {
+                    tokio::spawn(async move {
+                        serial::run_serial_reader_reconnect(
+                            serial_port,
+                            serial_baudrate,
+                            transport_broadcast_tx,
+                            transport_reconnect,
+                            transport_cancel,
+                        )
+                        .await;
+                    });
+                    let writer_cancel = cancel.clone();
+                    tokio::spawn(async move {
+                        drop(serial_rx);
+                        writer_cancel.cancelled().await;
+                    });
+                } else {
+                    tracing::warn!("serial port unavailable, client writes disabled");
+                    let writer_cancel = cancel.clone();
+                    tokio::spawn(async move {
+                        drop(serial_rx);
+                        writer_cancel.cancelled().await;
+                    });
+                }
             }
         }
     }

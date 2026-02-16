@@ -31,7 +31,11 @@ pub struct ServerArgs {
 
     /// Serial port device path
     #[arg(short, long)]
-    pub port: String,
+    pub port: Option<String>,
+
+    /// TCP socket address (host:port)
+    #[arg(long)]
+    pub tcp: Option<String>,
 
     /// Baud rate
     #[arg(short, long, default_value_t = 115_200)]
@@ -118,12 +122,26 @@ mod tests {
         match cli.command {
             Command::Server(args) => {
                 assert_eq!(args.name, "test1");
-                assert_eq!(args.port, "/dev/ttyUSB0");
+                assert_eq!(args.port.as_deref(), Some("/dev/ttyUSB0"));
+                assert!(args.tcp.is_none());
                 assert_eq!(args.baudrate, 115_200);
                 assert!(!args.no_log);
                 assert!(!args.no_interactive);
                 assert!(!args.pty);
                 assert!(!args.no_reconnect);
+            }
+            _ => panic!("expected Server command"),
+        }
+    }
+
+    #[test]
+    fn parse_server_tcp() {
+        let cli = Cli::parse_from(["rmux", "server", "test1", "--tcp", "localhost:4321"]);
+        match cli.command {
+            Command::Server(args) => {
+                assert_eq!(args.name, "test1");
+                assert!(args.port.is_none());
+                assert_eq!(args.tcp.as_deref(), Some("localhost:4321"));
             }
             _ => panic!("expected Server command"),
         }
@@ -151,7 +169,7 @@ mod tests {
         match cli.command {
             Command::Server(args) => {
                 assert_eq!(args.name, "dev1");
-                assert_eq!(args.port, "/dev/ttyACM0");
+                assert_eq!(args.port.as_deref(), Some("/dev/ttyACM0"));
                 assert_eq!(args.baudrate, 9600);
                 assert!(args.no_log);
                 assert_eq!(

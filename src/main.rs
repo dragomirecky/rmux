@@ -29,9 +29,16 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Server(args) => {
             validate_name(&args.name)?;
+            if args.port.is_none() && args.tcp.is_none() {
+                anyhow::bail!("either --port or --tcp must be specified");
+            }
+            if args.port.is_some() && args.tcp.is_some() {
+                anyhow::bail!("--port and --tcp are mutually exclusive");
+            }
             let config = ServerConfig {
                 name: args.name,
                 port: args.port,
+                tcp: args.tcp,
                 baudrate: args.baudrate,
                 log: !args.no_log,
                 log_dir: args.log_dir,
@@ -132,10 +139,16 @@ fn cmd_status(name: &str) -> anyhow::Result<()> {
         anyhow::bail!("server '{}' is not running (stale state file cleaned up)", name);
     }
 
+    let is_tcp = state.port.starts_with("tcp://");
+
     println!("Server: {}", state.name);
     println!("  PID:       {}", state.pid);
-    println!("  Port:      {}", state.port);
-    println!("  Baud rate: {}", state.baudrate);
+    if is_tcp {
+        println!("  Transport: {}", state.port);
+    } else {
+        println!("  Port:      {}", state.port);
+        println!("  Baud rate: {}", state.baudrate);
+    }
     println!("  Socket:    {}", state.socket);
     println!("  Started:   {}", state.started_at);
 

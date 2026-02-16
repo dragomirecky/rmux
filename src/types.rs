@@ -6,7 +6,8 @@ use std::path::PathBuf;
 #[allow(clippy::struct_excessive_bools)]
 pub struct ServerConfig {
     pub name: String,
-    pub port: String,
+    pub port: Option<String>,
+    pub tcp: Option<String>,
     pub baudrate: u32,
     pub log: bool,
     pub log_dir: Option<PathBuf>,

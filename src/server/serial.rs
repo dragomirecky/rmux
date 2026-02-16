@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc};
 use tokio_serial::SerialStream;
 use tokio_util::sync::CancellationToken;
@@ -72,6 +73,51 @@ pub async fn run_serial_reader_reconnect(
 
         if !reconnect {
             tracing::info!("reconnect disabled, shutting down serial reader");
+            return;
+        }
+
+        if cancel.is_cancelled() {
+            return;
+        }
+
+        tracing::info!("reconnecting in {:?}...", backoff);
+        tokio::select! {
+            () = cancel.cancelled() => return,
+            () = tokio::time::sleep(backoff) => {}
+        }
+        backoff = (backoff * 2).min(MAX_BACKOFF);
+    }
+}
+
+/// Open a TCP connection to the given address.
+pub async fn open_tcp(addr: &str) -> std::io::Result<TcpStream> {
+    TcpStream::connect(addr).await
+}
+
+/// TCP reader with reconnection logic: connects to the address, reads, and reconnects on failure.
+pub async fn run_tcp_reader_reconnect(
+    addr: String,
+    broadcast_tx: broadcast::Sender<Arc<Vec<u8>>>,
+    reconnect: bool,
+    cancel: CancellationToken,
+) {
+    let mut backoff = INITIAL_BACKOFF;
+
+    loop {
+        match open_tcp(&addr).await {
+            Ok(stream) => {
+                tracing::info!("TCP connected to {}", addr);
+                backoff = INITIAL_BACKOFF;
+                let (read_half, _write_half) = tokio::io::split(stream);
+                run_serial_reader(read_half, broadcast_tx.clone(), cancel.clone()).await;
+            }
+            Err(e) => {
+                tracing::error!("failed to connect to TCP {}: {e}", addr);
+            }
+        }
+
+        if !reconnect {
+            tracing::info!("reconnect disabled, shutting down TCP reader");
             return;
         }
 
