@@ -1,5 +1,6 @@
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
+use tokio::sync::mpsc;
 
 use crate::protocol::{encode_data, MessageKind, ParseEvent, Parser};
 
@@ -130,116 +131,146 @@ impl LineTimestamper {
     }
 }
 
-/// Run the client in interactive mode with raw terminal I/O.
+/// Run interactive mode with raw terminal I/O using channel-based transport.
 ///
-/// Keyboard input is forwarded to the server. Serial data received from
-/// the server is displayed on the terminal. Ctrl+] quits.
+/// Reads incoming data from `data_rx` and displays it on the terminal.
+/// Keyboard input is forwarded via `data_tx`. Ctrl+] quits.
 pub async fn run_interactive(
-    stream: UnixStream,
+    mut data_rx: mpsc::Receiver<Vec<u8>>,
+    data_tx: mpsc::Sender<Vec<u8>>,
     timestamps: bool,
 ) -> anyhow::Result<()> {
-    let (mut read_half, mut write_half) = stream.into_split();
-
-    // Enable raw mode
     crossterm::terminal::enable_raw_mode()?;
 
-    let result = run_interactive_inner(&mut read_half, &mut write_half, timestamps).await;
+    let result = async {
+        use crossterm::event::{Event, EventStream};
+        use futures::StreamExt;
 
-    // Always restore terminal mode
+        let mut event_stream = EventStream::new();
+        let mut escape_state = EscapeState::Normal;
+        let mut timestamper = LineTimestamper::new();
+        let mut stdout = tokio::io::stdout();
+
+        loop {
+            tokio::select! {
+                data = data_rx.recv() => {
+                    match data {
+                        Some(bytes) => {
+                            if timestamps {
+                                let stamped = timestamper.process(&bytes);
+                                stdout.write_all(&stamped).await?;
+                            } else {
+                                stdout.write_all(&bytes).await?;
+                            }
+                            stdout.flush().await?;
+                        }
+                        None => {
+                            eprintln!("\r\nConnection lost");
+                            break;
+                        }
+                    }
+                }
+                event = event_stream.next() => {
+                    match event {
+                        Some(Ok(Event::Key(key_event))) => {
+                            match handle_key(key_event, &mut escape_state) {
+                                KeyAction::Quit => break,
+                                KeyAction::SendByte(b) => {
+                                    let _ = data_tx.send(vec![b]).await;
+                                }
+                                KeyAction::SendBytes(bytes) => {
+                                    let _ = data_tx.send(bytes).await;
+                                }
+                                KeyAction::None => {}
+                            }
+                        }
+                        Some(Ok(_)) => {}
+                        Some(Err(e)) => {
+                            eprintln!("\r\nInput error: {e}");
+                            break;
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+    .await;
+
     crossterm::terminal::disable_raw_mode()?;
-    println!(); // newline after raw mode
+    println!();
 
     result
 }
 
-async fn run_interactive_inner(
-    read_half: &mut tokio::net::unix::OwnedReadHalf,
-    write_half: &mut tokio::net::unix::OwnedWriteHalf,
+/// Run interactive mode over a Unix socket with protocol framing.
+///
+/// Sets up bridge tasks between the socket (using the rmux protocol) and
+/// the channel-based `run_interactive`, then cleans up on return.
+pub async fn run_interactive_socket(
+    stream: UnixStream,
     timestamps: bool,
 ) -> anyhow::Result<()> {
-    use crossterm::event::{Event, EventStream};
-    use futures::StreamExt;
+    let (mut read_half, mut write_half) = stream.into_split();
+    let (incoming_tx, incoming_rx) = mpsc::channel::<Vec<u8>>(256);
+    let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<Vec<u8>>(256);
 
-    let mut event_stream = EventStream::new();
-    let mut parser = Parser::new();
-    let mut buf = [0u8; 4096];
-    let mut escape_state = EscapeState::Normal;
-    let mut timestamper = LineTimestamper::new();
-
-    let mut stdout = tokio::io::stdout();
-
-    loop {
-        tokio::select! {
-            // Read from server
-            result = read_half.read(&mut buf) => {
-                match result {
-                    Ok(0) => {
-                        eprintln!("\r\nConnection closed by server");
-                        break;
-                    }
-                    Ok(n) => {
-                        let events = parser.feed_bytes(&buf[..n]);
-                        let mut data_buf = Vec::new();
-                        for event in events {
-                            match event {
-                                ParseEvent::DataByte(b) => data_buf.push(b),
-                                ParseEvent::MalformedEscape(b) => {
-                                    data_buf.push(0x00);
-                                    data_buf.push(b);
-                                }
-                                ParseEvent::Message { kind: MessageKind::Response, json } => {
-                                    // Display response messages
-                                    let msg = format!("\r\n[server: {json}]\r\n");
-                                    stdout.write_all(msg.as_bytes()).await?;
-                                }
-                                _ => {}
+    // Reader bridge: socket → protocol parser → incoming channel
+    let reader_handle = tokio::spawn(async move {
+        let mut parser = Parser::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match read_half.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    let events = parser.feed_bytes(&buf[..n]);
+                    let mut data_buf = Vec::new();
+                    for event in events {
+                        match event {
+                            ParseEvent::DataByte(b) => data_buf.push(b),
+                            ParseEvent::MalformedEscape(b) => {
+                                data_buf.push(0x00);
+                                data_buf.push(b);
                             }
-                        }
-                        if !data_buf.is_empty() {
-                            if timestamps {
-                                let stamped = timestamper.process(&data_buf);
-                                stdout.write_all(&stamped).await?;
-                            } else {
-                                stdout.write_all(&data_buf).await?;
+                            ParseEvent::Message {
+                                kind: MessageKind::Response,
+                                json,
+                            } => {
+                                let msg = format!("\r\n[server: {json}]\r\n");
+                                if incoming_tx.send(msg.into_bytes()).await.is_err() {
+                                    return;
+                                }
                             }
-                            stdout.flush().await?;
+                            _ => {}
                         }
                     }
-                    Err(e) => {
-                        eprintln!("\r\nRead error: {e}");
-                        break;
+                    if !data_buf.is_empty() && incoming_tx.send(data_buf).await.is_err() {
+                        return;
                     }
                 }
-            }
-            // Read keyboard input
-            event = event_stream.next() => {
-                match event {
-                    Some(Ok(Event::Key(key_event))) => {
-                        match handle_key(key_event, &mut escape_state) {
-                            KeyAction::Quit => break,
-                            KeyAction::SendByte(b) => {
-                                let encoded = encode_data(&[b]);
-                                write_half.write_all(&encoded).await?;
-                            }
-                            KeyAction::SendBytes(bytes) => {
-                                let encoded = encode_data(&bytes);
-                                write_half.write_all(&encoded).await?;
-                            }
-                            KeyAction::None => {}
-                        }
-                    }
-                    Some(Ok(_)) => {} // ignore non-key events
-                    Some(Err(e)) => {
-                        eprintln!("\r\nInput error: {e}");
-                        break;
-                    }
-                    None => break,
-                }
+                Err(_) => break,
             }
         }
-    }
+    });
 
-    Ok(())
+    // Writer bridge: outgoing channel → encode_data → socket
+    let writer_handle = tokio::spawn(async move {
+        while let Some(data) = outgoing_rx.recv().await {
+            let encoded = encode_data(&data);
+            if write_half.write_all(&encoded).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let result = run_interactive(incoming_rx, outgoing_tx, timestamps).await;
+
+    reader_handle.abort();
+    writer_handle.abort();
+
+    result
 }
 
 /// Escape sequence state machine for keyboard shortcuts.

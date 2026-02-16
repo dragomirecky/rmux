@@ -64,6 +64,14 @@ pub struct ServerArgs {
     /// Disable auto-reconnect on serial port errors
     #[arg(long, default_value_t = false)]
     pub no_reconnect: bool,
+
+    /// Show timestamps on output lines
+    #[arg(short = 'T', long, overrides_with = "no_timestamps")]
+    pub timestamps: bool,
+
+    /// Disable timestamps on output lines
+    #[arg(long, overrides_with = "timestamps")]
+    pub no_timestamps: bool,
 }
 
 #[derive(Debug, clap::Args)]

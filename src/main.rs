@@ -1,3 +1,5 @@
+use std::io::IsTerminal;
+
 use clap::Parser;
 use rmux::cli::{Cli, Command};
 use rmux::types::ServerConfig;
@@ -47,6 +49,13 @@ fn main() -> anyhow::Result<()> {
                 pty_link: args.pty_link,
                 reconnect: !args.no_reconnect,
                 socket_path: None,
+                timestamps: if args.timestamps {
+                    true
+                } else if args.no_timestamps {
+                    false
+                } else {
+                    !std::io::stdout().is_terminal()
+                },
             };
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(server::run_server(config))?;

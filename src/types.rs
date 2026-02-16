@@ -16,6 +16,7 @@ pub struct ServerConfig {
     pub pty_link: Option<PathBuf>,
     pub reconnect: bool,
     pub socket_path: Option<PathBuf>,
+    pub timestamps: bool,
 }
 
 /// Persisted state file written by a running server.

@@ -183,7 +183,7 @@ pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
         let console_cancel = cancel.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                console::run_console(console_rx, console_serial_tx, console_cancel).await
+                console::run_console(console_rx, console_serial_tx, console_cancel, config.timestamps).await
             {
                 tracing::error!("console error: {e}");
             }

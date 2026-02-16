@@ -77,7 +77,7 @@ pub async fn run_client(args: ClientArgs) -> anyhow::Result<()> {
     };
 
     if is_interactive {
-        interactive::run_interactive(stream, timestamps).await?;
+        interactive::run_interactive_socket(stream, timestamps).await?;
     } else {
         let output = command::run_command(
             &mut stream,
