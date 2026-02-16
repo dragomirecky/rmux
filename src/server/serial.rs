@@ -6,10 +6,8 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_serial::SerialStream;
 use tokio_util::sync::CancellationToken;
 
-/// Maximum backoff duration for serial reconnection.
-const MAX_BACKOFF: Duration = Duration::from_secs(30);
-/// Initial backoff duration.
-const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
+/// Fixed polling interval for reconnection monitoring.
+const RECONNECT_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Open a serial port with the given settings.
 pub fn open_serial(port: &str, baudrate: u32) -> Result<SerialStream, tokio_serial::Error> {
@@ -40,7 +38,7 @@ pub async fn run_serial_reader(
                         let _ = broadcast_tx.send(data);
                     }
                     Err(e) => {
-                        tracing::error!("serial read error: {e}");
+                        tracing::warn!("serial read error: {e}");
                         return;
                     }
                 }
@@ -49,30 +47,94 @@ pub async fn run_serial_reader(
     }
 }
 
-/// Serial reader with reconnection logic: opens the port, reads, and reconnects on failure.
-pub async fn run_serial_reader_reconnect(
+/// Manages a serial connection with reconnection logic for both reader and writer.
+///
+/// Monitors the device file, opens the serial port, runs a combined read+write
+/// select loop, and reconnects on failure. Injects marker lines into the broadcast
+/// stream on disconnect/reconnect.
+pub async fn run_serial_connection(
     port: String,
     baudrate: u32,
     broadcast_tx: broadcast::Sender<Arc<Vec<u8>>>,
+    mut serial_rx: mpsc::Receiver<Vec<u8>>,
     reconnect: bool,
     cancel: CancellationToken,
 ) {
-    let mut backoff = INITIAL_BACKOFF;
+    let mut was_connected = false;
 
     loop {
+        // Wait for device file to exist before attempting open
+        if tokio::fs::metadata(&port).await.is_err() {
+            if !reconnect && was_connected {
+                tracing::info!("reconnect disabled, shutting down serial connection");
+                return;
+            }
+            if cancel.is_cancelled() {
+                return;
+            }
+            tokio::select! {
+                () = cancel.cancelled() => return,
+                () = tokio::time::sleep(RECONNECT_INTERVAL) => {}
+            }
+            continue;
+        }
+
         match open_serial(&port, baudrate) {
             Ok(serial) => {
-                tracing::info!("serial port {} opened", port);
-                backoff = INITIAL_BACKOFF;
-                run_serial_reader(serial, broadcast_tx.clone(), cancel.clone()).await;
+                if was_connected {
+                    tracing::info!("serial port {} reconnected", port);
+                    let _ = broadcast_tx.send(Arc::new(b"--- reconnected ---\r\n".to_vec()));
+                } else {
+                    tracing::info!("serial port {} opened", port);
+                }
+                was_connected = true;
+
+                let (mut read_half, mut write_half) = tokio::io::split(serial);
+                let mut buf = [0u8; 4096];
+
+                loop {
+                    tokio::select! {
+                        () = cancel.cancelled() => return,
+                        result = read_half.read(&mut buf) => {
+                            match result {
+                                Ok(0) => {
+                                    tracing::warn!("serial reader EOF");
+                                    break;
+                                }
+                                Ok(n) => {
+                                    let data = Arc::new(buf[..n].to_vec());
+                                    let _ = broadcast_tx.send(data);
+                                }
+                                Err(e) => {
+                                    tracing::warn!("serial read error: {e}");
+                                    break;
+                                }
+                            }
+                        }
+                        msg = serial_rx.recv() => {
+                            match msg {
+                                Some(data) => {
+                                    if let Err(e) = write_half.write_all(&data).await {
+                                        tracing::warn!("serial write error: {e}");
+                                        break;
+                                    }
+                                }
+                                None => return,
+                            }
+                        }
+                    }
+                }
+
+                // Connection lost
+                let _ = broadcast_tx.send(Arc::new(b"\r\n--- connection lost ---\r\n".to_vec()));
             }
             Err(e) => {
-                tracing::error!("failed to open serial port {}: {e}", port);
+                tracing::debug!("failed to open serial port {}: {e}", port);
             }
         }
 
         if !reconnect {
-            tracing::info!("reconnect disabled, shutting down serial reader");
+            tracing::info!("reconnect disabled, shutting down serial connection");
             return;
         }
 
@@ -80,26 +142,25 @@ pub async fn run_serial_reader_reconnect(
             return;
         }
 
-        tracing::info!("reconnecting in {:?}...", backoff);
         tokio::select! {
             () = cancel.cancelled() => return,
-            () = tokio::time::sleep(backoff) => {}
+            () = tokio::time::sleep(RECONNECT_INTERVAL) => {}
         }
-        backoff = (backoff * 2).min(MAX_BACKOFF);
     }
 }
 
-/// Open a TCP connection to the given address.
+/// Open a TCP connection to the given address with a 2-second timeout.
 pub async fn open_tcp(addr: &str) -> std::io::Result<TcpStream> {
-    TcpStream::connect(addr).await
+    tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(addr))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timeout"))?
 }
 
 /// Manages a TCP connection with reconnection logic for both reader and writer.
 ///
-/// Unlike serial (where reader and writer are independent), TCP reader and writer
-/// share the same `TcpStream`. When either side fails, the entire connection must
-/// be re-established. This function owns the `mpsc::Receiver` so it survives
-/// across reconnections.
+/// Connects to the given address, runs a combined read+write select loop, and
+/// reconnects on failure. Injects marker lines into the broadcast stream on
+/// disconnect/reconnect.
 pub async fn run_tcp_connection(
     addr: String,
     broadcast_tx: broadcast::Sender<Arc<Vec<u8>>>,
@@ -107,13 +168,19 @@ pub async fn run_tcp_connection(
     reconnect: bool,
     cancel: CancellationToken,
 ) {
-    let mut backoff = INITIAL_BACKOFF;
+    let mut was_connected = false;
 
     loop {
         match open_tcp(&addr).await {
             Ok(stream) => {
-                tracing::info!("TCP connected to {}", addr);
-                backoff = INITIAL_BACKOFF;
+                if was_connected {
+                    tracing::info!("TCP reconnected to {}", addr);
+                    let _ = broadcast_tx.send(Arc::new(b"--- reconnected ---\r\n".to_vec()));
+                } else {
+                    tracing::info!("TCP connected to {}", addr);
+                }
+                was_connected = true;
+
                 let (mut read_half, mut write_half) = tokio::io::split(stream);
 
                 // Run reader and writer in a combined select loop so that
@@ -133,7 +200,7 @@ pub async fn run_tcp_connection(
                                     let _ = broadcast_tx.send(data);
                                 }
                                 Err(e) => {
-                                    tracing::error!("TCP read error: {e}");
+                                    tracing::warn!("TCP read error: {e}");
                                     break;
                                 }
                             }
@@ -142,7 +209,7 @@ pub async fn run_tcp_connection(
                             match msg {
                                 Some(data) => {
                                     if let Err(e) = write_half.write_all(&data).await {
-                                        tracing::error!("TCP write error: {e}");
+                                        tracing::warn!("TCP write error: {e}");
                                         break;
                                     }
                                 }
@@ -151,9 +218,12 @@ pub async fn run_tcp_connection(
                         }
                     }
                 }
+
+                // Connection lost
+                let _ = broadcast_tx.send(Arc::new(b"\r\n--- connection lost ---\r\n".to_vec()));
             }
             Err(e) => {
-                tracing::error!("failed to connect to TCP {}: {e}", addr);
+                tracing::debug!("failed to connect to TCP {}: {e}", addr);
             }
         }
 
@@ -166,12 +236,10 @@ pub async fn run_tcp_connection(
             return;
         }
 
-        tracing::info!("reconnecting in {:?}...", backoff);
         tokio::select! {
             () = cancel.cancelled() => return,
-            () = tokio::time::sleep(backoff) => {}
+            () = tokio::time::sleep(RECONNECT_INTERVAL) => {}
         }
-        backoff = (backoff * 2).min(MAX_BACKOFF);
     }
 }
 

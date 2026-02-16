@@ -496,14 +496,24 @@ async fn tcp_reconnect_after_disconnect() {
     // Drop the mock device to simulate TCP server going away
     drop(mock_device);
 
-    // Wait for rmux to detect the disconnect and start reconnecting
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Read the "connection lost" marker
+    let lost_marker = client.read_data(TIMEOUT).await;
+    let lost_str = String::from_utf8_lossy(&lost_marker);
+    assert!(
+        lost_str.contains("--- connection lost ---"),
+        "expected connection lost marker, got: {lost_str:?}"
+    );
 
     // Start a new TCP listener on the same port and accept the reconnection
     let mut new_device = server.accept_reconnect(Duration::from_secs(10)).await;
 
-    // Give the connection a moment to stabilize
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Read the "reconnected" marker
+    let reconn_marker = client.read_data(TIMEOUT).await;
+    let reconn_str = String::from_utf8_lossy(&reconn_marker);
+    assert!(
+        reconn_str.contains("--- reconnected ---"),
+        "expected reconnected marker, got: {reconn_str:?}"
+    );
 
     // Verify data flows again after reconnection
     new_device.write(b"after reconnect").await.unwrap();
@@ -538,11 +548,25 @@ async fn tcp_reconnect_write_after_reconnect() {
 
     // Drop mock device to simulate disconnect
     drop(mock_device);
-    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Read the "connection lost" marker
+    let lost_marker = client.read_data(TIMEOUT).await;
+    let lost_str = String::from_utf8_lossy(&lost_marker);
+    assert!(
+        lost_str.contains("--- connection lost ---"),
+        "expected connection lost marker, got: {lost_str:?}"
+    );
 
     // Accept reconnection
     let mut new_device = server.accept_reconnect(Duration::from_secs(10)).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Read the "reconnected" marker
+    let reconn_marker = client.read_data(TIMEOUT).await;
+    let reconn_str = String::from_utf8_lossy(&reconn_marker);
+    assert!(
+        reconn_str.contains("--- reconnected ---"),
+        "expected reconnected marker, got: {reconn_str:?}"
+    );
 
     // Verify writes work after reconnection
     client.send_data(b"second").await;
@@ -570,22 +594,36 @@ async fn tcp_reconnect_multiple_cycles() {
 
     // Drop first connection
     drop(mock_device);
-    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Read connection lost marker
+    let lost = client.read_data(TIMEOUT).await;
+    assert!(String::from_utf8_lossy(&lost).contains("--- connection lost ---"));
 
     // Reconnect cycle 1
     let mut device1 = server.accept_reconnect(Duration::from_secs(10)).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Read reconnected marker
+    let reconn = client.read_data(TIMEOUT).await;
+    assert!(String::from_utf8_lossy(&reconn).contains("--- reconnected ---"));
+
     device1.write(b"cycle1").await.unwrap();
     let data = client.read_data(TIMEOUT).await;
     assert_eq!(data, b"cycle1");
 
     // Drop again
     drop(device1);
-    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Read connection lost marker
+    let lost2 = client.read_data(TIMEOUT).await;
+    assert!(String::from_utf8_lossy(&lost2).contains("--- connection lost ---"));
 
     // Reconnect cycle 2
     let mut device2 = server.accept_reconnect(Duration::from_secs(10)).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Read reconnected marker
+    let reconn2 = client.read_data(TIMEOUT).await;
+    assert!(String::from_utf8_lossy(&reconn2).contains("--- reconnected ---"));
+
     device2.write(b"cycle2").await.unwrap();
     let data = client.read_data(TIMEOUT).await;
     assert_eq!(data, b"cycle2");

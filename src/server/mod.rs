@@ -128,52 +128,20 @@ pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
             .await;
         });
     } else {
-        // Serial transport
+        // Serial transport: single task manages both reader and writer with reconnection
         let serial_port = config.port.clone().unwrap_or_default();
         let serial_baudrate = config.baudrate;
-
-        match serial::open_serial(&serial_port, serial_baudrate) {
-            Ok(serial_stream) => {
-                let (read_half, write_half) = tokio::io::split(serial_stream);
-
-                let reader_cancel = transport_cancel.clone();
-                tokio::spawn(async move {
-                    serial::run_serial_reader(read_half, transport_broadcast_tx, reader_cancel).await;
-                });
-
-                let writer_cancel = transport_cancel;
-                tokio::spawn(async move {
-                    serial::run_serial_writer(write_half, serial_rx, writer_cancel).await;
-                });
-            }
-            Err(e) => {
-                tracing::error!("failed to open serial port {}: {e}", serial_port);
-                if transport_reconnect {
-                    tokio::spawn(async move {
-                        serial::run_serial_reader_reconnect(
-                            serial_port,
-                            serial_baudrate,
-                            transport_broadcast_tx,
-                            transport_reconnect,
-                            transport_cancel,
-                        )
-                        .await;
-                    });
-                    let writer_cancel = cancel.clone();
-                    tokio::spawn(async move {
-                        drop(serial_rx);
-                        writer_cancel.cancelled().await;
-                    });
-                } else {
-                    tracing::warn!("serial port unavailable, client writes disabled");
-                    let writer_cancel = cancel.clone();
-                    tokio::spawn(async move {
-                        drop(serial_rx);
-                        writer_cancel.cancelled().await;
-                    });
-                }
-            }
-        }
+        tokio::spawn(async move {
+            serial::run_serial_connection(
+                serial_port,
+                serial_baudrate,
+                transport_broadcast_tx,
+                serial_rx,
+                transport_reconnect,
+                transport_cancel,
+            )
+            .await;
+        });
     }
 
     // Spawn log writer if enabled
