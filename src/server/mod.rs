@@ -176,7 +176,7 @@ pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
         None
     };
 
-    // Spawn interactive console if requested
+    // Spawn interactive console or non-interactive monitor
     if config.interactive {
         let console_rx = broadcast_tx.subscribe();
         let console_serial_tx = serial_tx.clone();
@@ -186,6 +186,16 @@ pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
                 console::run_console(console_rx, console_serial_tx, console_cancel, config.timestamps).await
             {
                 tracing::error!("console error: {e}");
+            }
+        });
+    } else {
+        let monitor_rx = broadcast_tx.subscribe();
+        let monitor_cancel = cancel.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                console::run_monitor(monitor_rx, monitor_cancel, config.timestamps).await
+            {
+                tracing::error!("monitor error: {e}");
             }
         });
     }
