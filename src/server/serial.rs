@@ -94,10 +94,16 @@ pub async fn open_tcp(addr: &str) -> std::io::Result<TcpStream> {
     TcpStream::connect(addr).await
 }
 
-/// TCP reader with reconnection logic: connects to the address, reads, and reconnects on failure.
-pub async fn run_tcp_reader_reconnect(
+/// Manages a TCP connection with reconnection logic for both reader and writer.
+///
+/// Unlike serial (where reader and writer are independent), TCP reader and writer
+/// share the same `TcpStream`. When either side fails, the entire connection must
+/// be re-established. This function owns the `mpsc::Receiver` so it survives
+/// across reconnections.
+pub async fn run_tcp_connection(
     addr: String,
     broadcast_tx: broadcast::Sender<Arc<Vec<u8>>>,
+    mut serial_rx: mpsc::Receiver<Vec<u8>>,
     reconnect: bool,
     cancel: CancellationToken,
 ) {
@@ -108,8 +114,43 @@ pub async fn run_tcp_reader_reconnect(
             Ok(stream) => {
                 tracing::info!("TCP connected to {}", addr);
                 backoff = INITIAL_BACKOFF;
-                let (read_half, _write_half) = tokio::io::split(stream);
-                run_serial_reader(read_half, broadcast_tx.clone(), cancel.clone()).await;
+                let (mut read_half, mut write_half) = tokio::io::split(stream);
+
+                // Run reader and writer in a combined select loop so that
+                // when either side fails we break out and reconnect both.
+                let mut buf = [0u8; 4096];
+                loop {
+                    tokio::select! {
+                        () = cancel.cancelled() => return,
+                        result = read_half.read(&mut buf) => {
+                            match result {
+                                Ok(0) => {
+                                    tracing::warn!("TCP reader EOF");
+                                    break;
+                                }
+                                Ok(n) => {
+                                    let data = Arc::new(buf[..n].to_vec());
+                                    let _ = broadcast_tx.send(data);
+                                }
+                                Err(e) => {
+                                    tracing::error!("TCP read error: {e}");
+                                    break;
+                                }
+                            }
+                        }
+                        msg = serial_rx.recv() => {
+                            match msg {
+                                Some(data) => {
+                                    if let Err(e) = write_half.write_all(&data).await {
+                                        tracing::error!("TCP write error: {e}");
+                                        break;
+                                    }
+                                }
+                                None => return, // channel closed, server shutting down
+                            }
+                        }
+                    }
+                }
             }
             Err(e) => {
                 tracing::error!("failed to connect to TCP {}: {e}", addr);
@@ -117,7 +158,7 @@ pub async fn run_tcp_reader_reconnect(
         }
 
         if !reconnect {
-            tracing::info!("reconnect disabled, shutting down TCP reader");
+            tracing::info!("reconnect disabled, shutting down TCP connection");
             return;
         }
 

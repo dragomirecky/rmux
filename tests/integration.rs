@@ -1,6 +1,6 @@
 mod common;
 
-use common::{TestClient, TestServer};
+use common::{TcpTestServer, TestClient, TestServer};
 use rmux::log_reader;
 use rmux::protocol::ControlMessage;
 use std::time::Duration;
@@ -406,4 +406,189 @@ async fn history_empty_when_no_log() {
     let nonexistent = std::path::PathBuf::from("/tmp/rmux_nonexistent_log_file.log");
     let result = log_reader::read_last_lines(&nonexistent, 10);
     assert!(result.is_err(), "reading nonexistent log should return an error");
+}
+
+// ---------------------------------------------------------------------------
+// TCP transport tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn tcp_server_to_client_data_flow() {
+    let (server, mut mock_device) = TcpTestServer::start("tcp_s2c").await;
+    let mut client = TestClient::connect(&server.socket_path).await;
+
+    mock_device.write(b"hello from tcp device").await.unwrap();
+
+    let data = client.read_data(TIMEOUT).await;
+    assert_eq!(data, b"hello from tcp device");
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn tcp_client_to_device_data_flow() {
+    let (server, mut mock_device) = TcpTestServer::start("tcp_c2d").await;
+    let mut client = TestClient::connect(&server.socket_path).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    client.send_data(b"AT\r\n").await;
+
+    let mut buf = [0u8; 256];
+    let mut received = Vec::new();
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while received.len() < 4 {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, mock_device.read(&mut buf)).await {
+            Ok(Ok(n)) => received.extend_from_slice(&buf[..n]),
+            _ => break,
+        }
+    }
+    assert_eq!(received, b"AT\r\n");
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn tcp_bidirectional_data_flow() {
+    let (server, mut mock_device) = TcpTestServer::start("tcp_bidir").await;
+    let mut client = TestClient::connect(&server.socket_path).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Client sends to device
+    client.send_data(b"PING").await;
+
+    let mut buf = [0u8; 256];
+    let mut received = Vec::new();
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while received.len() < 4 {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, mock_device.read(&mut buf)).await {
+            Ok(Ok(n)) => received.extend_from_slice(&buf[..n]),
+            _ => break,
+        }
+    }
+    assert_eq!(received, b"PING");
+
+    // Device sends back
+    mock_device.write(b"PONG").await.unwrap();
+    let data = client.read_data(TIMEOUT).await;
+    assert_eq!(data, b"PONG");
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn tcp_reconnect_after_disconnect() {
+    let (server, mut mock_device) = TcpTestServer::start("tcp_reconn").await;
+    let mut client = TestClient::connect(&server.socket_path).await;
+
+    // Verify initial connection works
+    mock_device.write(b"before disconnect").await.unwrap();
+    let data = client.read_data(TIMEOUT).await;
+    assert_eq!(data, b"before disconnect");
+
+    // Drop the mock device to simulate TCP server going away
+    drop(mock_device);
+
+    // Wait for rmux to detect the disconnect and start reconnecting
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Start a new TCP listener on the same port and accept the reconnection
+    let mut new_device = server.accept_reconnect(Duration::from_secs(10)).await;
+
+    // Give the connection a moment to stabilize
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Verify data flows again after reconnection
+    new_device.write(b"after reconnect").await.unwrap();
+    let data = client.read_data(TIMEOUT).await;
+    assert_eq!(data, b"after reconnect");
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn tcp_reconnect_write_after_reconnect() {
+    let (server, mut mock_device) = TcpTestServer::start("tcp_reconn_wr").await;
+    let mut client = TestClient::connect(&server.socket_path).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Verify initial write works
+    client.send_data(b"first").await;
+    let mut buf = [0u8; 256];
+    let mut received = Vec::new();
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while received.len() < 5 {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, mock_device.read(&mut buf)).await {
+            Ok(Ok(n)) => received.extend_from_slice(&buf[..n]),
+            _ => break,
+        }
+    }
+    assert_eq!(received, b"first");
+
+    // Drop mock device to simulate disconnect
+    drop(mock_device);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Accept reconnection
+    let mut new_device = server.accept_reconnect(Duration::from_secs(10)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Verify writes work after reconnection
+    client.send_data(b"second").await;
+    let mut received2 = Vec::new();
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while received2.len() < 6 {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, new_device.read(&mut buf)).await {
+            Ok(Ok(n)) => received2.extend_from_slice(&buf[..n]),
+            _ => break,
+        }
+    }
+    assert_eq!(received2, b"second");
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn tcp_reconnect_multiple_cycles() {
+    let (server, mock_device) = TcpTestServer::start("tcp_mrc").await;
+    let mut client = TestClient::connect(&server.socket_path).await;
+
+    // Drop first connection
+    drop(mock_device);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Reconnect cycle 1
+    let mut device1 = server.accept_reconnect(Duration::from_secs(10)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    device1.write(b"cycle1").await.unwrap();
+    let data = client.read_data(TIMEOUT).await;
+    assert_eq!(data, b"cycle1");
+
+    // Drop again
+    drop(device1);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Reconnect cycle 2
+    let mut device2 = server.accept_reconnect(Duration::from_secs(10)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    device2.write(b"cycle2").await.unwrap();
+    let data = client.read_data(TIMEOUT).await;
+    assert_eq!(data, b"cycle2");
+
+    server.stop().await;
 }

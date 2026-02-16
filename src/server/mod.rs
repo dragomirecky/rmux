@@ -115,49 +115,18 @@ pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
     let transport_reconnect = config.reconnect;
 
     if let Some(ref tcp_addr) = config.tcp {
-        // TCP transport
+        // TCP transport: single task manages both reader and writer with reconnection
         let addr = tcp_addr.clone();
-        match serial::open_tcp(&addr).await {
-            Ok(tcp_stream) => {
-                let (read_half, write_half) = tokio::io::split(tcp_stream);
-
-                let reader_cancel = transport_cancel.clone();
-                tokio::spawn(async move {
-                    serial::run_serial_reader(read_half, transport_broadcast_tx, reader_cancel).await;
-                });
-
-                let writer_cancel = transport_cancel;
-                tokio::spawn(async move {
-                    serial::run_serial_writer(write_half, serial_rx, writer_cancel).await;
-                });
-            }
-            Err(e) => {
-                tracing::error!("failed to connect to TCP {}: {e}", addr);
-                if transport_reconnect {
-                    tokio::spawn(async move {
-                        serial::run_tcp_reader_reconnect(
-                            addr,
-                            transport_broadcast_tx,
-                            transport_reconnect,
-                            transport_cancel,
-                        )
-                        .await;
-                    });
-                    let writer_cancel = cancel.clone();
-                    tokio::spawn(async move {
-                        drop(serial_rx);
-                        writer_cancel.cancelled().await;
-                    });
-                } else {
-                    tracing::warn!("TCP connection unavailable, client writes disabled");
-                    let writer_cancel = cancel.clone();
-                    tokio::spawn(async move {
-                        drop(serial_rx);
-                        writer_cancel.cancelled().await;
-                    });
-                }
-            }
-        }
+        tokio::spawn(async move {
+            serial::run_tcp_connection(
+                addr,
+                transport_broadcast_tx,
+                serial_rx,
+                transport_reconnect,
+                transport_cancel,
+            )
+            .await;
+        });
     } else {
         // Serial transport
         let serial_port = config.port.clone().unwrap_or_default();

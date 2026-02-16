@@ -12,7 +12,7 @@ use rmux::server::serial;
 
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -412,6 +412,167 @@ impl TestServer {
         // Give tasks time to wind down (log writer flushes on cancel)
         tokio::time::sleep(Duration::from_millis(100)).await;
         self.tmp_dir
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TcpTestServer — uses a TCP listener as the mock backend
+// ---------------------------------------------------------------------------
+
+/// A mock TCP backend that simulates a device (e.g. Renode) exposed over TCP.
+/// Holds the accepted `TcpStream` for reading/writing data.
+pub struct MockTcpDevice {
+    pub stream: TcpStream,
+}
+
+impl MockTcpDevice {
+    pub async fn write(&mut self, data: &[u8]) -> std::io::Result<()> {
+        self.stream.write_all(data).await
+    }
+
+    pub async fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.stream.read(buf).await
+    }
+}
+
+/// A test server that uses TCP transport instead of serial.
+/// The `tcp_listener_addr` can be used to restart the mock backend.
+pub struct TcpTestServer {
+    pub socket_path: PathBuf,
+    pub tcp_listener_addr: std::net::SocketAddr,
+    cancel: CancellationToken,
+    tmp_dir: PathBuf,
+}
+
+impl TcpTestServer {
+    /// Start a test server backed by a TCP connection.
+    ///
+    /// Returns `(TcpTestServer, MockTcpDevice)`. The mock device is the accepted
+    /// TCP connection that the server connected to.
+    pub async fn start(name: &str) -> (Self, MockTcpDevice) {
+        // Bind a TCP listener on a random port
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_addr = tcp_listener.local_addr().unwrap();
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "rmux_tcp_integ_{}_{name}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let socket_path = tmp_dir.join(format!("{name}.sock"));
+
+        let cancel = CancellationToken::new();
+
+        // Set up channels
+        let (broadcast_tx, _broadcast_rx) = broadcaster::new_broadcast();
+        let (serial_tx, serial_rx) = mpsc::channel::<Vec<u8>>(256);
+
+        // Spawn TCP connection task (will connect to our listener)
+        let tcp_cancel = cancel.clone();
+        let tcp_broadcast = broadcast_tx.clone();
+        let addr_str = tcp_addr.to_string();
+        tokio::spawn(async move {
+            serial::run_tcp_connection(
+                addr_str,
+                tcp_broadcast,
+                serial_rx,
+                true, // reconnect enabled
+                tcp_cancel,
+            )
+            .await;
+        });
+
+        // Accept the connection from the server
+        let (tcp_stream, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            tcp_listener.accept(),
+        )
+        .await
+        .expect("timed out waiting for TCP connect")
+        .expect("TCP accept failed");
+
+        let mock_device = MockTcpDevice { stream: tcp_stream };
+
+        // Give the connection a moment to stabilize
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Bind Unix socket for clients
+        let _ = std::fs::remove_file(&socket_path);
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        let ctx = Arc::new(ClientContext {
+            port: format!("tcp://{tcp_addr}"),
+            baudrate: 0,
+            serial_connected: true,
+            client_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        });
+
+        // Client acceptor loop
+        let acceptor_cancel = cancel.clone();
+        let acceptor_cancel2 = cancel.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = acceptor_cancel.cancelled() => break,
+                    result = listener.accept() => {
+                        match result {
+                            Ok((stream, _addr)) => {
+                                let client_broadcast = broadcast_tx.clone();
+                                let client_serial = serial_tx.clone();
+                                let client_ctx = ctx.clone();
+                                let client_cancel = acceptor_cancel2.clone();
+                                tokio::spawn(async move {
+                                    client_handler::handle_client(
+                                        stream,
+                                        client_broadcast,
+                                        client_serial,
+                                        client_ctx,
+                                        client_cancel,
+                                    ).await;
+                                });
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+            }
+        });
+
+        // Wait for socket to be connectable
+        for _ in 0..100 {
+            if UnixStream::connect(&socket_path).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        (
+            TcpTestServer {
+                socket_path,
+                tcp_listener_addr: tcp_addr,
+                cancel,
+                tmp_dir,
+            },
+            mock_device,
+        )
+    }
+
+    /// Accept a new TCP connection from the server after a reconnect.
+    /// Binds a new listener on the same address and waits for the server to connect.
+    pub async fn accept_reconnect(&self, timeout: Duration) -> MockTcpDevice {
+        let tcp_listener = TcpListener::bind(self.tcp_listener_addr).await.unwrap();
+        let (tcp_stream, _) = tokio::time::timeout(timeout, tcp_listener.accept())
+            .await
+            .expect("timed out waiting for TCP reconnect")
+            .expect("TCP accept failed");
+        MockTcpDevice { stream: tcp_stream }
+    }
+
+    pub async fn stop(self) {
+        self.cancel.cancel();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = std::fs::remove_file(&self.socket_path);
+        let _ = std::fs::remove_dir_all(&self.tmp_dir);
     }
 }
 
