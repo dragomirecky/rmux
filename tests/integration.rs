@@ -7,6 +7,19 @@ use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Simple deterministic PRNG (xorshift32) so tests don't depend on `rand`.
+fn pseudo_random_bytes(seed: u32, len: usize) -> Vec<u8> {
+    let mut state = seed;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state & 0xFF) as u8
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Data flow tests
 // ---------------------------------------------------------------------------
@@ -627,6 +640,344 @@ async fn tcp_reconnect_multiple_cycles() {
     device2.write(b"cycle2").await.unwrap();
     let data = client.read_data(TIMEOUT).await;
     assert_eq!(data, b"cycle2");
+
+    server.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Random / non-ASCII / binary stress tests
+// ---------------------------------------------------------------------------
+
+/// Random bytes (including non-ASCII and NULs) pass through uncorrupted.
+#[tokio::test]
+async fn random_binary_data_survives() {
+    let server = TestServer::start("rand_bin").await;
+    let mut client = TestClient::connect(&server.socket_path).await;
+
+    let payload = pseudo_random_bytes(0xDEAD, 1024);
+    server.mock_serial.write(&payload).await.unwrap();
+
+    let data = client.read_all_data(payload.len(), TIMEOUT).await;
+
+    assert_eq!(
+        data.len(),
+        payload.len(),
+        "expected {} bytes, got {}",
+        payload.len(),
+        data.len()
+    );
+    assert_eq!(data, payload, "random binary data was corrupted in transit");
+
+    server.stop().await;
+}
+
+/// A payload consisting entirely of NUL bytes (worst case for the protocol's
+/// NUL-escape scheme) passes through without corruption or server exit.
+#[tokio::test]
+async fn all_nul_payload() {
+    let server = TestServer::start("all_nul").await;
+    let mut client = TestClient::connect(&server.socket_path).await;
+
+    let payload = vec![0x00u8; 512];
+    server.mock_serial.write(&payload).await.unwrap();
+
+    let data = client.read_all_data(payload.len(), TIMEOUT).await;
+
+    assert_eq!(data.len(), payload.len());
+    assert_eq!(data, payload);
+
+    server.stop().await;
+}
+
+/// Many small bursts of random data sent rapidly simulate a noisy UART line.
+/// Uses concurrent write/read because the total payload exceeds the PTY buffer.
+#[tokio::test]
+async fn rapid_random_bursts() {
+    let server = TestServer::start("rand_burst").await;
+    let mut client = TestClient::connect(&server.socket_path).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut expected = Vec::new();
+    for i in 0..100u32 {
+        let chunk = pseudo_random_bytes(i.wrapping_mul(7919), 32);
+        expected.extend_from_slice(&chunk);
+    }
+
+    // Write all bursts from a background task
+    let mock = server.mock_serial.clone();
+    let write_handle = tokio::spawn(async move {
+        for i in 0..100u32 {
+            let chunk = pseudo_random_bytes(i.wrapping_mul(7919), 32);
+            mock.write(&chunk).await.unwrap();
+        }
+    });
+
+    let data = client.read_all_data(expected.len(), TIMEOUT).await;
+    write_handle.await.unwrap();
+
+    assert_eq!(
+        data.len(),
+        expected.len(),
+        "data loss during rapid random bursts: got {}, expected {}",
+        data.len(),
+        expected.len()
+    );
+    assert_eq!(data, expected);
+
+    server.stop().await;
+}
+
+/// After receiving random garbage, the server should still respond to control
+/// commands and deliver normal data.
+#[tokio::test]
+async fn server_healthy_after_random_data() {
+    let server = TestServer::start("rand_health").await;
+    let mut client = TestClient::connect(&server.socket_path).await;
+
+    // Send random garbage through the serial device (concurrent write/read
+    // because the payload may exceed the PTY buffer)
+    let garbage = pseudo_random_bytes(0xCAFE, 2048);
+    let mock = server.mock_serial.clone();
+    let write_garbage = garbage.clone();
+    let write_handle = tokio::spawn(async move {
+        mock.write(&write_garbage).await.unwrap();
+    });
+
+    // Drain the garbage from the client
+    let drained = client.read_all_data(garbage.len(), TIMEOUT).await;
+    write_handle.await.unwrap();
+    assert_eq!(drained.len(), garbage.len(), "failed to drain garbage data");
+
+    // Now verify the server is still healthy: send a status command
+    client.send_control(&ControlMessage::Status).await;
+    let json = client
+        .read_response(TIMEOUT)
+        .await
+        .expect("server should still respond to status after random data");
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["baudrate"], 115_200);
+
+    // And verify normal data still flows
+    server.mock_serial.write(b"still alive").await.unwrap();
+    let data = client.read_data(TIMEOUT).await;
+    assert_eq!(data, b"still alive");
+
+    server.stop().await;
+}
+
+/// Multiple clients should all receive the same random data without corruption.
+#[tokio::test]
+async fn multiple_clients_receive_random_data() {
+    let server = TestServer::start("rand_multi").await;
+    let mut client1 = TestClient::connect(&server.socket_path).await;
+    let mut client2 = TestClient::connect(&server.socket_path).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let payload = pseudo_random_bytes(0xBEEF, 512);
+    server.mock_serial.write(&payload).await.unwrap();
+
+    let data1 = client1.read_all_data(payload.len(), TIMEOUT).await;
+    let data2 = client2.read_all_data(payload.len(), TIMEOUT).await;
+
+    assert_eq!(data1, payload, "client1 data corrupted");
+    assert_eq!(data2, payload, "client2 data corrupted");
+
+    server.stop().await;
+}
+
+/// Random data with logging enabled: server and log writer must not crash.
+#[tokio::test]
+async fn random_data_with_logging() {
+    let server = TestServer::start_with_logging("rand_log").await;
+    let log_path = server.log_path.clone().expect("log_path should be set");
+    let mut client = TestClient::connect(&server.socket_path).await;
+
+    // Send random data that includes embedded newlines (so the log writer
+    // actually flushes lines) as well as arbitrary binary values.
+    let mut payload = pseudo_random_bytes(0xF00D, 512);
+    // Sprinkle some newlines to trigger log line writes
+    for i in (0..payload.len()).step_by(64) {
+        payload[i] = b'\n';
+    }
+    server.mock_serial.write(&payload).await.unwrap();
+
+    // Drain from client
+    let data = client.read_all_data(payload.len(), TIMEOUT).await;
+    assert_eq!(data.len(), payload.len());
+
+    // Wait for log writer to flush
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let tmp_dir = server.stop_keep_files().await;
+
+    // Log file should exist and not be empty
+    let log_content = std::fs::read(&log_path).unwrap();
+    assert!(!log_content.is_empty(), "log file should not be empty");
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+/// Large payload of random data (16 KB) to stress the pipeline.
+/// Uses concurrent write/read to avoid PTY buffer deadlock.
+#[tokio::test]
+async fn large_random_payload() {
+    let server = TestServer::start("rand_large").await;
+    let mut client = TestClient::connect(&server.socket_path).await;
+
+    let payload = pseudo_random_bytes(0x1234, 16384);
+
+    // Must write and read concurrently: the PTY buffer (~4KB) is smaller
+    // than the payload, so the write blocks until the reader drains data.
+    let mock = server.mock_serial.clone();
+    let write_payload = payload.clone();
+    let write_handle = tokio::spawn(async move {
+        mock.write(&write_payload).await.unwrap();
+    });
+
+    let data = client
+        .read_all_data(payload.len(), Duration::from_secs(10))
+        .await;
+
+    write_handle.await.unwrap();
+
+    assert_eq!(
+        data.len(),
+        payload.len(),
+        "large payload: got {} bytes, expected {}",
+        data.len(),
+        payload.len()
+    );
+    assert_eq!(data, payload);
+
+    server.stop().await;
+}
+
+/// Bytes that look like protocol control prefixes (0x00 followed by 'C' or 'R')
+/// embedded in serial data should pass through as plain data, not be
+/// misinterpreted as protocol messages.
+#[tokio::test]
+async fn protocol_like_bytes_in_serial_data() {
+    let server = TestServer::start("proto_like").await;
+    let mut client = TestClient::connect(&server.socket_path).await;
+
+    // Craft a payload with bytes that look like protocol control sequences
+    let payload: Vec<u8> = vec![
+        b'A',
+        0x00, b'C', // looks like start of a control message
+        b'B',
+        0x00, b'R', // looks like start of a response message
+        b'C',
+        0x00, 0x00, // escaped NUL
+        b'D',
+    ];
+    server.mock_serial.write(&payload).await.unwrap();
+
+    let data = client.read_all_data(payload.len(), TIMEOUT).await;
+
+    assert_eq!(
+        data, payload,
+        "protocol-like bytes in serial data should pass through unchanged"
+    );
+
+    server.stop().await;
+}
+
+/// TCP transport handles random binary data without crashing.
+#[tokio::test]
+async fn tcp_random_binary_data() {
+    let (server, mut mock_device) = TcpTestServer::start("tcp_rand").await;
+    let mut client = TestClient::connect(&server.socket_path).await;
+
+    let payload = pseudo_random_bytes(0xABCD, 1024);
+    mock_device.write(&payload).await.unwrap();
+
+    let data = client.read_all_data(payload.len(), TIMEOUT).await;
+
+    assert_eq!(data.len(), payload.len());
+    assert_eq!(data, payload, "TCP random data corrupted");
+
+    server.stop().await;
+}
+
+/// A single large chunk of data (simulates a UART burst or buffer dump) must
+/// pass through without data loss or server exit.
+/// Uses concurrent write/read to avoid PTY buffer deadlock.
+#[tokio::test]
+async fn large_single_chunk_data() {
+    let server = TestServer::start("big_chunk").await;
+    let mut client = TestClient::connect(&server.socket_path).await;
+
+    // 32 KB in one write — exercises the PTY buffer backpressure path
+    let payload = pseudo_random_bytes(0x7777, 32768);
+
+    let mock = server.mock_serial.clone();
+    let write_payload = payload.clone();
+    let write_handle = tokio::spawn(async move {
+        mock.write(&write_payload).await.unwrap();
+    });
+
+    let data = client
+        .read_all_data(payload.len(), Duration::from_secs(15))
+        .await;
+
+    write_handle.await.unwrap();
+
+    assert_eq!(
+        data.len(),
+        payload.len(),
+        "large single chunk: got {} bytes, expected {}",
+        data.len(),
+        payload.len()
+    );
+    assert_eq!(data, payload);
+
+    server.stop().await;
+}
+
+/// Client sends random binary data to the serial device.
+#[tokio::test]
+async fn client_sends_random_data_to_serial() {
+    let server = TestServer::start("rand_c2s").await;
+    let mut client = TestClient::connect(&server.socket_path).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Avoid NUL in the payload so we don't have to deal with protocol escaping
+    // from the client side (encode_data handles it, but the mock serial read
+    // gets raw bytes). Instead, use bytes 0x01-0xFF.
+    let payload: Vec<u8> = pseudo_random_bytes(0x9999, 256)
+        .into_iter()
+        .map(|b| if b == 0 { 1 } else { b })
+        .collect();
+
+    // Send in chunks to avoid overwhelming the pipeline (the client handler
+    // forwards each byte individually through the mpsc channel)
+    for chunk in payload.chunks(32) {
+        client.send_data(chunk).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let mut buf = [0u8; 4096];
+    let mut received = Vec::new();
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while received.len() < payload.len() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, server.mock_serial.read(&mut buf)).await {
+            Ok(Ok(n)) => received.extend_from_slice(&buf[..n]),
+            _ => break,
+        }
+    }
+
+    assert_eq!(
+        received.len(),
+        payload.len(),
+        "client→serial: got {} bytes, expected {}",
+        received.len(),
+        payload.len()
+    );
+    assert_eq!(received, payload);
 
     server.stop().await;
 }

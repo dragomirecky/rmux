@@ -37,9 +37,13 @@ impl tokio::io::AsyncRead for AsyncFdReader {
             };
             let unfilled = buf.initialize_unfilled();
             match guard.try_io(|fd| {
-                let n = nix::unistd::read(fd.as_raw_fd(), unfilled)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-                Ok(n)
+                match nix::unistd::read(fd.as_raw_fd(), unfilled) {
+                    Ok(n) => Ok(n),
+                    Err(nix::errno::Errno::EAGAIN) => {
+                        Err(std::io::ErrorKind::WouldBlock.into())
+                    }
+                    Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
+                }
             }) {
                 Ok(Ok(n)) => {
                     buf.advance(n);
@@ -68,8 +72,13 @@ impl tokio::io::AsyncWrite for AsyncFdWriter {
                 std::task::Poll::Pending => return std::task::Poll::Pending,
             };
             match guard.try_io(|fd| {
-                nix::unistd::write(fd, buf)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+                match nix::unistd::write(fd, buf) {
+                    Ok(n) => Ok(n),
+                    Err(nix::errno::Errno::EAGAIN) => {
+                        Err(std::io::ErrorKind::WouldBlock.into())
+                    }
+                    Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
+                }
             }) {
                 Ok(Ok(n)) => return std::task::Poll::Ready(Ok(n)),
                 Ok(Err(e)) => return std::task::Poll::Ready(Err(e)),
@@ -151,8 +160,13 @@ impl MockSerial {
         while written < data.len() {
             let mut guard = self.master.writable().await?;
             match guard.try_io(|fd| {
-                nix::unistd::write(fd, &data[written..])
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+                match nix::unistd::write(fd, &data[written..]) {
+                    Ok(n) => Ok(n),
+                    Err(nix::errno::Errno::EAGAIN) => {
+                        Err(std::io::ErrorKind::WouldBlock.into())
+                    }
+                    Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
+                }
             }) {
                 Ok(Ok(n)) => written += n,
                 Ok(Err(e)) => return Err(e),
@@ -167,8 +181,13 @@ impl MockSerial {
         loop {
             let mut guard = self.master.readable().await?;
             match guard.try_io(|fd| {
-                nix::unistd::read(fd.as_raw_fd(), buf)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+                match nix::unistd::read(fd.as_raw_fd(), buf) {
+                    Ok(n) => Ok(n),
+                    Err(nix::errno::Errno::EAGAIN) => {
+                        Err(std::io::ErrorKind::WouldBlock.into())
+                    }
+                    Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
+                }
             }) {
                 Ok(Ok(n)) => return Ok(n),
                 Ok(Err(e)) => return Err(e),
@@ -645,6 +664,34 @@ impl TestClient {
     pub async fn send_data(&mut self, data: &[u8]) {
         let encoded = encode_data(data);
         self.stream.write_all(&encoded).await.expect("send_data failed");
+    }
+
+    /// Read and decode data bytes until we have at least `expected` bytes,
+    /// or the deadline expires. Unlike `read_data`, this doesn't use a short
+    /// drain window — it reads continuously until the target is met.
+    pub async fn read_all_data(&mut self, expected: usize, timeout: Duration) -> Vec<u8> {
+        let mut buf = [0u8; 8192];
+        let mut decoded = Vec::new();
+        let deadline = tokio::time::Instant::now() + timeout;
+
+        while decoded.len() < expected {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, self.stream.read(&mut buf)).await {
+                Ok(Ok(n)) if n > 0 => {
+                    let events = self.parser.feed_bytes(&buf[..n]);
+                    for event in events {
+                        if let ParseEvent::DataByte(b) = event {
+                            decoded.push(b);
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+        decoded
     }
 
     /// Send a protocol-encoded control message to the server.
