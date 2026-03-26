@@ -1,5 +1,4 @@
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use crate::protocol::{encode_data, MessageKind, ParseEvent, Parser};
@@ -205,15 +204,15 @@ pub async fn run_interactive(
     result
 }
 
-/// Run interactive mode over a Unix socket with protocol framing.
+/// Run interactive mode over any async stream with protocol framing.
 ///
-/// Sets up bridge tasks between the socket (using the rmux protocol) and
+/// Sets up bridge tasks between the stream (using the rmux protocol) and
 /// the channel-based `run_interactive`, then cleans up on return.
 pub async fn run_interactive_socket(
-    stream: UnixStream,
+    stream: impl AsyncRead + AsyncWrite + Send + 'static,
     timestamps: bool,
 ) -> anyhow::Result<()> {
-    let (mut read_half, mut write_half) = stream.into_split();
+    let (mut read_half, mut write_half) = tokio::io::split(stream);
     let (incoming_tx, incoming_rx) = mpsc::channel::<Vec<u8>>(256);
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<Vec<u8>>(256);
 

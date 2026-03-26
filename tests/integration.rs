@@ -1,6 +1,6 @@
 mod common;
 
-use common::{TcpTestServer, TestClient, TestServer};
+use common::{TcpTestClient, TcpTestServer, TestClient, TestServer};
 use rmux::log_reader;
 use rmux::protocol::ControlMessage;
 use std::time::Duration;
@@ -1065,6 +1065,302 @@ async fn client_sends_random_data_to_serial() {
         payload.len()
     );
     assert_eq!(received, payload);
+
+    server.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// TCP client listener tests
+// ---------------------------------------------------------------------------
+
+/// TCP client receives data from serial device.
+#[tokio::test]
+async fn tcp_client_server_to_client_data_flow() {
+    let server = TestServer::start_with_tcp("tcp_s2c").await;
+    let addr = server.tcp_listen_addr.unwrap();
+    let mut client = TcpTestClient::connect(addr).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    server.mock_serial.write(b"hello from device").await.unwrap();
+
+    let data = client.read_data(TIMEOUT).await;
+    assert_eq!(data, b"hello from device");
+
+    server.stop().await;
+}
+
+/// TCP client sends data to serial device.
+#[tokio::test]
+async fn tcp_client_to_serial_data_flow() {
+    let server = TestServer::start_with_tcp("tcp_c2s").await;
+    let addr = server.tcp_listen_addr.unwrap();
+    let mut client = TcpTestClient::connect(addr).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    client.send_data(b"AT\r\n").await;
+
+    let mut buf = [0u8; 256];
+    let mut received = Vec::new();
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while received.len() < 4 {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, server.mock_serial.read(&mut buf)).await {
+            Ok(Ok(n)) => received.extend_from_slice(&buf[..n]),
+            _ => break,
+        }
+    }
+
+    assert_eq!(received, b"AT\r\n");
+
+    server.stop().await;
+}
+
+/// Full round-trip over TCP: client sends → serial receives → serial responds → TCP client reads.
+#[tokio::test]
+async fn tcp_client_bidirectional_data_flow() {
+    let server = TestServer::start_with_tcp("tcp_bidir").await;
+    let addr = server.tcp_listen_addr.unwrap();
+    let mut client = TcpTestClient::connect(addr).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    client.send_data(b"PING").await;
+
+    let mut buf = [0u8; 256];
+    let mut serial_received = Vec::new();
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while serial_received.len() < 4 {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, server.mock_serial.read(&mut buf)).await {
+            Ok(Ok(n)) => serial_received.extend_from_slice(&buf[..n]),
+            _ => break,
+        }
+    }
+    assert_eq!(serial_received, b"PING");
+
+    server.mock_serial.write(b"PONG").await.unwrap();
+
+    let data = client.read_data(TIMEOUT).await;
+    assert_eq!(data, b"PONG");
+
+    server.stop().await;
+}
+
+/// Binary data containing NUL bytes flows correctly over TCP client connection.
+#[tokio::test]
+async fn tcp_client_nul_bytes() {
+    let server = TestServer::start_with_tcp("tcp_nul").await;
+    let addr = server.tcp_listen_addr.unwrap();
+    let mut client = TcpTestClient::connect(addr).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Serial device sends data containing NUL bytes
+    let data_with_nuls = b"before\x00middle\x00after";
+    server.mock_serial.write(data_with_nuls).await.unwrap();
+
+    let received = client.read_all_data(data_with_nuls.len(), TIMEOUT).await;
+    assert_eq!(received, data_with_nuls);
+
+    server.stop().await;
+}
+
+/// Random binary data survives TCP client transport.
+#[tokio::test]
+async fn tcp_client_binary_data_roundtrip() {
+    let server = TestServer::start_with_tcp("tcp_bin").await;
+    let addr = server.tcp_listen_addr.unwrap();
+    let mut client = TcpTestClient::connect(addr).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let payload = pseudo_random_bytes(0xABCD, 512);
+    server.mock_serial.write(&payload).await.unwrap();
+
+    let received = client.read_all_data(payload.len(), TIMEOUT).await;
+    assert_eq!(
+        received.len(),
+        payload.len(),
+        "TCP binary roundtrip: got {} bytes, expected {}",
+        received.len(),
+        payload.len()
+    );
+    assert_eq!(received, payload);
+
+    server.stop().await;
+}
+
+/// Two TCP clients connected simultaneously both receive serial data.
+#[tokio::test]
+async fn multiple_tcp_clients_receive_broadcast() {
+    let server = TestServer::start_with_tcp("tcp_multi").await;
+    let addr = server.tcp_listen_addr.unwrap();
+    let mut client1 = TcpTestClient::connect(addr).await;
+    let mut client2 = TcpTestClient::connect(addr).await;
+
+    // Give handlers time to subscribe
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    server.mock_serial.write(b"broadcast msg").await.unwrap();
+
+    let data1 = client1.read_data(TIMEOUT).await;
+    let data2 = client2.read_data(TIMEOUT).await;
+
+    assert_eq!(data1, b"broadcast msg");
+    assert_eq!(data2, b"broadcast msg");
+
+    server.stop().await;
+}
+
+/// One Unix client + one TCP client both receive the same serial data.
+#[tokio::test]
+async fn mixed_unix_and_tcp_clients_receive_broadcast() {
+    let server = TestServer::start_with_tcp("tcp_mixed").await;
+    let addr = server.tcp_listen_addr.unwrap();
+
+    let mut unix_client = TestClient::connect(&server.socket_path).await;
+    let mut tcp_client = TcpTestClient::connect(addr).await;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    server.mock_serial.write(b"mixed broadcast").await.unwrap();
+
+    let unix_data = unix_client.read_data(TIMEOUT).await;
+    let tcp_data = tcp_client.read_data(TIMEOUT).await;
+
+    assert_eq!(unix_data, b"mixed broadcast");
+    assert_eq!(tcp_data, b"mixed broadcast");
+
+    server.stop().await;
+}
+
+/// Drop one TCP client, verify others still receive data.
+#[tokio::test]
+async fn tcp_client_disconnect_doesnt_affect_others() {
+    let server = TestServer::start_with_tcp("tcp_disc").await;
+    let addr = server.tcp_listen_addr.unwrap();
+
+    let client1 = TcpTestClient::connect(addr).await;
+    let mut client2 = TcpTestClient::connect(addr).await;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Drop first client
+    drop(client1);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Second client should still receive data
+    server.mock_serial.write(b"still alive").await.unwrap();
+    let data = client2.read_data(TIMEOUT).await;
+    assert_eq!(data, b"still alive");
+
+    server.stop().await;
+}
+
+/// Drop a TCP client, verify Unix client is unaffected (and vice versa).
+#[tokio::test]
+async fn mixed_client_disconnect_isolation() {
+    let server = TestServer::start_with_tcp("tcp_iso").await;
+    let addr = server.tcp_listen_addr.unwrap();
+
+    let tcp_client = TcpTestClient::connect(addr).await;
+    let mut unix_client = TestClient::connect(&server.socket_path).await;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Drop TCP client
+    drop(tcp_client);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Unix client should still work
+    server.mock_serial.write(b"unix ok").await.unwrap();
+    let data = unix_client.read_data(TIMEOUT).await;
+    assert_eq!(data, b"unix ok");
+
+    server.stop().await;
+}
+
+/// TCP client sends status command and receives server info response.
+#[tokio::test]
+async fn tcp_client_status_command() {
+    let server = TestServer::start_with_tcp("tcp_status").await;
+    let addr = server.tcp_listen_addr.unwrap();
+    let mut client = TcpTestClient::connect(addr).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    client.send_control(&ControlMessage::Status).await;
+
+    let response = client.read_response(TIMEOUT).await;
+    assert!(response.is_some(), "should receive a status response");
+    let json: serde_json::Value = serde_json::from_str(&response.unwrap()).unwrap();
+    assert_eq!(json["port"], "/dev/mock");
+    assert_eq!(json["baudrate"], 115_200);
+    assert!(json["serial"].as_bool().unwrap());
+
+    server.stop().await;
+}
+
+/// TCP client sends unknown command and receives error response.
+#[tokio::test]
+async fn tcp_client_unknown_command() {
+    let server = TestServer::start_with_tcp("tcp_unk").await;
+    let addr = server.tcp_listen_addr.unwrap();
+    let mut client = TcpTestClient::connect(addr).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    client.send_control(&ControlMessage::Unknown("bogus".into())).await;
+
+    let response = client.read_response(TIMEOUT).await;
+    assert!(response.is_some(), "should receive an error response");
+    let json: serde_json::Value = serde_json::from_str(&response.unwrap()).unwrap();
+    assert_eq!(json["error"], "unknown command");
+
+    server.stop().await;
+}
+
+/// TCP listener coexists with Unix socket — both accept independently.
+#[tokio::test]
+async fn tcp_listener_coexists_with_unix() {
+    let server = TestServer::start_with_tcp("tcp_coexist").await;
+    let addr = server.tcp_listen_addr.unwrap();
+
+    // Connect via both transports
+    let mut unix_client = TestClient::connect(&server.socket_path).await;
+    let mut tcp_client = TcpTestClient::connect(addr).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Both should be able to send data to serial
+    unix_client.send_data(b"U").await;
+    tcp_client.send_data(b"T").await;
+
+    // Read from serial — should get both bytes (order may vary)
+    let mut buf = [0u8; 256];
+    let mut received = Vec::new();
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while received.len() < 2 {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, server.mock_serial.read(&mut buf)).await {
+            Ok(Ok(n)) => received.extend_from_slice(&buf[..n]),
+            _ => break,
+        }
+    }
+
+    assert_eq!(received.len(), 2);
+    assert!(received.contains(&b'U'));
+    assert!(received.contains(&b'T'));
+
+    // Both should receive broadcast data
+    server.mock_serial.write(b"both").await.unwrap();
+    let unix_data = unix_client.read_data(TIMEOUT).await;
+    let tcp_data = tcp_client.read_data(TIMEOUT).await;
+    assert_eq!(unix_data, b"both");
+    assert_eq!(tcp_data, b"both");
 
     server.stop().await;
 }

@@ -9,9 +9,28 @@ pub mod state;
 use crate::types::{ServerConfig, ServerStateFile};
 use client_handler::ClientContext;
 use std::sync::Arc;
-use tokio::net::UnixListener;
+use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+
+/// Accept a TCP connection if the listener is present, otherwise pend forever.
+async fn accept_tcp(
+    listener: Option<&TcpListener>,
+) -> std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)> {
+    match listener {
+        Some(l) => l.accept().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Parse a listen address string, defaulting to 127.0.0.1 if only a port is given.
+fn resolve_listen_addr(addr: &str) -> String {
+    if addr.contains(':') {
+        addr.to_string()
+    } else {
+        format!("127.0.0.1:{addr}")
+    }
+}
 
 /// Run the server with the given configuration.
 #[allow(clippy::too_many_lines)]
@@ -83,6 +102,17 @@ pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
         config.port.clone().unwrap_or_default()
     };
 
+    // Set up TCP listener for remote clients if requested
+    let resolved_listen = config.listen.as_deref().map(resolve_listen_addr);
+    let tcp_listener = if let Some(ref addr) = resolved_listen {
+        let listener = TcpListener::bind(addr).await?;
+        tracing::info!("TCP client listener on {addr}");
+        eprintln!("TCP listen: {addr}");
+        Some(listener)
+    } else {
+        None
+    };
+
     // Write state file
     let state = ServerStateFile {
         name: config.name.clone(),
@@ -93,6 +123,7 @@ pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
         log_file: log_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
         pty_device: pty_child.as_ref().map(|c| c.slave_path.clone()),
         started_at: chrono::Local::now().to_rfc3339(),
+        listen: resolved_listen,
     };
     state::write_state_file(&state)?;
 
@@ -200,7 +231,7 @@ pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
         });
     }
 
-    // Client acceptor loop
+    // Client acceptor loop (Unix + optional TCP)
     let acceptor_cancel = cancel.clone();
     loop {
         tokio::select! {
@@ -223,7 +254,30 @@ pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
                         });
                     }
                     Err(e) => {
-                        tracing::error!("accept error: {e}");
+                        tracing::error!("unix accept error: {e}");
+                    }
+                }
+            }
+            result = accept_tcp(tcp_listener.as_ref()) => {
+                match result {
+                    Ok((stream, addr)) => {
+                        tracing::info!("TCP client connected from {addr}");
+                        let client_broadcast = broadcast_tx.clone();
+                        let client_serial = serial_tx.clone();
+                        let client_ctx = ctx.clone();
+                        let client_cancel = cancel.clone();
+                        tokio::spawn(async move {
+                            client_handler::handle_client(
+                                stream,
+                                client_broadcast,
+                                client_serial,
+                                client_ctx,
+                                client_cancel,
+                            ).await;
+                        });
+                    }
+                    Err(e) => {
+                        tracing::error!("tcp accept error: {e}");
                     }
                 }
             }
@@ -244,4 +298,21 @@ pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
     }
     state::cleanup_state(&state.name);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_listen_addr_with_host() {
+        assert_eq!(resolve_listen_addr("0.0.0.0:5555"), "0.0.0.0:5555");
+        assert_eq!(resolve_listen_addr("192.168.1.1:8080"), "192.168.1.1:8080");
+    }
+
+    #[test]
+    fn parse_listen_addr_port_only() {
+        assert_eq!(resolve_listen_addr("5555"), "127.0.0.1:5555");
+        assert_eq!(resolve_listen_addr("8080"), "127.0.0.1:8080");
+    }
 }

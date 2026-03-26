@@ -65,6 +65,10 @@ pub struct ServerArgs {
     #[arg(long, default_value_t = false)]
     pub no_reconnect: bool,
 
+    /// TCP address for remote client connections (e.g., 0.0.0.0:5555 or just 5555)
+    #[arg(long)]
+    pub listen: Option<String>,
+
     /// Show timestamps on output lines
     #[arg(short = 'T', long, overrides_with = "no_timestamps")]
     pub timestamps: bool,
@@ -115,6 +119,10 @@ pub struct ClientArgs {
     /// Show history from last line matching this regex
     #[arg(short = 's', long, conflicts_with = "last")]
     pub since: Option<String>,
+
+    /// Connect to a remote server via TCP (host:port)
+    #[arg(long)]
+    pub remote: Option<String>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -290,6 +298,60 @@ mod tests {
         match cli.command {
             Command::Client(args) => {
                 assert_eq!(args.since.as_deref(), Some("ERROR"));
+            }
+            _ => panic!("expected Client command"),
+        }
+    }
+
+    #[test]
+    fn parse_server_with_listen() {
+        let cli = Cli::parse_from([
+            "rmux", "server", "test1", "-p", "/dev/ttyUSB0", "--listen", "0.0.0.0:5555",
+        ]);
+        match cli.command {
+            Command::Server(args) => {
+                assert_eq!(args.listen.as_deref(), Some("0.0.0.0:5555"));
+            }
+            _ => panic!("expected Server command"),
+        }
+    }
+
+    #[test]
+    fn parse_server_with_listen_port_only() {
+        let cli = Cli::parse_from([
+            "rmux", "server", "test1", "-p", "/dev/ttyUSB0", "--listen", "5555",
+        ]);
+        match cli.command {
+            Command::Server(args) => {
+                assert_eq!(args.listen.as_deref(), Some("5555"));
+            }
+            _ => panic!("expected Server command"),
+        }
+    }
+
+    #[test]
+    fn parse_client_with_remote() {
+        let cli = Cli::parse_from([
+            "rmux", "client", "test1", "--remote", "192.168.1.10:5555",
+        ]);
+        match cli.command {
+            Command::Client(args) => {
+                assert_eq!(args.remote.as_deref(), Some("192.168.1.10:5555"));
+            }
+            _ => panic!("expected Client command"),
+        }
+    }
+
+    #[test]
+    fn parse_client_remote_with_command() {
+        let cli = Cli::parse_from([
+            "rmux", "client", "test1", "--remote", "host:5555", "-c", "hello", "-t", "2",
+        ]);
+        match cli.command {
+            Command::Client(args) => {
+                assert_eq!(args.remote.as_deref(), Some("host:5555"));
+                assert_eq!(args.command.as_deref(), Some("hello"));
+                assert_eq!(args.timeout, Some(2.0));
             }
             _ => panic!("expected Client command"),
         }

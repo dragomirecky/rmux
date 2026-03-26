@@ -49,6 +49,7 @@ fn main() -> anyhow::Result<()> {
                 pty_link: args.pty_link,
                 reconnect: !args.no_reconnect,
                 socket_path: None,
+                listen: args.listen,
                 timestamps: if args.timestamps {
                     true
                 } else if args.no_timestamps {
@@ -121,15 +122,16 @@ fn cmd_list() -> anyhow::Result<()> {
 
     // Print table header
     println!(
-        "{:<15} {:<8} {:<20} {:<10} {:<8}",
-        "NAME", "PID", "PORT", "BAUD", "CLIENTS"
+        "{:<15} {:<8} {:<20} {:<10} {:<8} {:<20}",
+        "NAME", "PID", "PORT", "BAUD", "CLIENTS", "LISTEN"
     );
-    println!("{}", "-".repeat(65));
+    println!("{}", "-".repeat(85));
 
     for state in &entries {
+        let listen = state.listen.as_deref().unwrap_or("-");
         println!(
-            "{:<15} {:<8} {:<20} {:<10} {:<8}",
-            state.name, state.pid, state.port, state.baudrate, "-"
+            "{:<15} {:<8} {:<20} {:<10} {:<8} {:<20}",
+            state.name, state.pid, state.port, state.baudrate, "-", listen
         );
     }
 
@@ -159,6 +161,9 @@ fn cmd_status(name: &str) -> anyhow::Result<()> {
         println!("  Baud rate: {}", state.baudrate);
     }
     println!("  Socket:    {}", state.socket);
+    if let Some(ref listen) = state.listen {
+        println!("  Listen:    {listen}");
+    }
     println!("  Started:   {}", state.started_at);
 
     if let Some(ref log) = state.log_file {
@@ -197,6 +202,7 @@ mod tests {
             log_file: None,
             pty_device: None,
             started_at: "2024-01-01T00:00:00Z".into(),
+            listen: None,
         };
         let json = serde_json::to_string_pretty(&state).unwrap();
         std::fs::write(dir.join(format!("{name}.json")), json).unwrap();

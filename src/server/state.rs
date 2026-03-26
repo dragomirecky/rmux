@@ -48,6 +48,7 @@ mod tests {
             log_file: None,
             pty_device: None,
             started_at: "2024-01-01T00:00:00Z".into(),
+            listen: None,
         }
     }
 

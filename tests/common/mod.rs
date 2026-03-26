@@ -217,6 +217,7 @@ pub struct TestServer {
     pub socket_path: PathBuf,
     pub mock_serial: Arc<MockSerial>,
     pub log_path: Option<PathBuf>,
+    pub tcp_listen_addr: Option<std::net::SocketAddr>,
     cancel: CancellationToken,
     tmp_dir: PathBuf,
     tasks: Vec<tokio::task::JoinHandle<()>>,
@@ -317,6 +318,125 @@ impl TestServer {
             socket_path,
             mock_serial,
             log_path: None,
+            tcp_listen_addr: None,
+            cancel,
+            tmp_dir,
+            tasks,
+            _pty_permit: permit,
+        }
+    }
+
+    /// Start a test server with a TCP client listener alongside the Unix socket.
+    pub async fn start_with_tcp(name: &str) -> Self {
+        let permit = pty_semaphore().acquire_owned().await.unwrap();
+        let (mock_serial, slave_reader, slave_writer) =
+            MockSerial::new().expect("failed to create mock serial");
+        let mock_serial = Arc::new(mock_serial);
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "rmux_integ_tcp_{}_{name}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let socket_path = tmp_dir.join(format!("{name}.sock"));
+
+        let cancel = CancellationToken::new();
+
+        let (broadcast_tx, _broadcast_rx) = broadcaster::new_broadcast();
+        let (serial_tx, serial_rx) = mpsc::channel::<Vec<u8>>(256);
+
+        let mut tasks = Vec::new();
+
+        let reader_cancel = cancel.clone();
+        let reader_broadcast = broadcast_tx.clone();
+        tasks.push(tokio::spawn(async move {
+            serial::run_serial_reader(slave_reader, reader_broadcast, reader_cancel).await;
+        }));
+
+        let writer_cancel = cancel.clone();
+        tasks.push(tokio::spawn(async move {
+            serial::run_serial_writer(slave_writer, serial_rx, writer_cancel).await;
+        }));
+
+        // Bind Unix socket
+        let _ = std::fs::remove_file(&socket_path);
+        let unix_listener = UnixListener::bind(&socket_path).unwrap();
+
+        // Bind TCP listener
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_addr = tcp_listener.local_addr().unwrap();
+
+        let ctx = Arc::new(ClientContext {
+            port: "/dev/mock".into(),
+            baudrate: 115_200,
+            serial_connected: true,
+            client_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        });
+
+        // Dual-accept loop (Unix + TCP)
+        let acceptor_cancel = cancel.clone();
+        let acceptor_cancel2 = cancel.clone();
+        tasks.push(tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = acceptor_cancel.cancelled() => break,
+                    result = unix_listener.accept() => {
+                        match result {
+                            Ok((stream, _addr)) => {
+                                let client_broadcast = broadcast_tx.clone();
+                                let client_serial = serial_tx.clone();
+                                let client_ctx = ctx.clone();
+                                let client_cancel = acceptor_cancel2.clone();
+                                tokio::spawn(async move {
+                                    client_handler::handle_client(
+                                        stream,
+                                        client_broadcast,
+                                        client_serial,
+                                        client_ctx,
+                                        client_cancel,
+                                    ).await;
+                                });
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    result = tcp_listener.accept() => {
+                        match result {
+                            Ok((stream, _addr)) => {
+                                let client_broadcast = broadcast_tx.clone();
+                                let client_serial = serial_tx.clone();
+                                let client_ctx = ctx.clone();
+                                let client_cancel = acceptor_cancel2.clone();
+                                tokio::spawn(async move {
+                                    client_handler::handle_client(
+                                        stream,
+                                        client_broadcast,
+                                        client_serial,
+                                        client_ctx,
+                                        client_cancel,
+                                    ).await;
+                                });
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+            }
+        }));
+
+        // Wait for socket to be connectable
+        for _ in 0..100 {
+            if UnixStream::connect(&socket_path).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        TestServer {
+            socket_path,
+            mock_serial,
+            log_path: None,
+            tcp_listen_addr: Some(tcp_addr),
             cancel,
             tmp_dir,
             tasks,
@@ -430,6 +550,7 @@ impl TestServer {
             socket_path,
             mock_serial,
             log_path: Some(log_path),
+            tcp_listen_addr: None,
             cancel,
             tmp_dir,
             tasks,
@@ -731,6 +852,134 @@ impl TestClient {
 
     /// Read until a response message is received (timeout-protected).
     /// Returns the parsed JSON string from the response.
+    pub async fn read_response(&mut self, timeout: Duration) -> Option<String> {
+        let mut buf = [0u8; 8192];
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            match tokio::time::timeout(remaining, self.stream.read(&mut buf)).await {
+                Ok(Ok(n)) if n > 0 => {
+                    let events = self.parser.feed_bytes(&buf[..n]);
+                    for event in events {
+                        if let ParseEvent::Message {
+                            kind: MessageKind::Response,
+                            json,
+                        } = event
+                        {
+                            return Some(json);
+                        }
+                    }
+                }
+                _ => return None,
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TcpTestClient — wraps a TCP connection to the server
+// ---------------------------------------------------------------------------
+
+pub struct TcpTestClient {
+    stream: TcpStream,
+    parser: Parser,
+}
+
+impl TcpTestClient {
+    /// Connect to a test server via TCP.
+    pub async fn connect(addr: std::net::SocketAddr) -> Self {
+        let stream = TcpStream::connect(addr)
+            .await
+            .expect("failed to connect to test server via TCP");
+        TcpTestClient {
+            stream,
+            parser: Parser::new(),
+        }
+    }
+
+    /// Read and decode data bytes from the server (timeout-protected).
+    pub async fn read_data(&mut self, timeout: Duration) -> Vec<u8> {
+        let mut buf = [0u8; 8192];
+        let mut decoded = Vec::new();
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, self.stream.read(&mut buf)).await {
+                Ok(Ok(n)) if n > 0 => {
+                    let events = self.parser.feed_bytes(&buf[..n]);
+                    for event in events {
+                        if let ParseEvent::DataByte(b) = event {
+                            decoded.push(b);
+                        }
+                    }
+                    if !decoded.is_empty() {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        match tokio::time::timeout(Duration::from_millis(100), self.stream.read(&mut buf)).await {
+                            Ok(Ok(n)) if n > 0 => {
+                                let events = self.parser.feed_bytes(&buf[..n]);
+                                for event in events {
+                                    if let ParseEvent::DataByte(b) = event {
+                                        decoded.push(b);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        decoded
+    }
+
+    /// Send protocol-encoded data to the server.
+    pub async fn send_data(&mut self, data: &[u8]) {
+        let encoded = encode_data(data);
+        self.stream.write_all(&encoded).await.expect("send_data failed");
+    }
+
+    /// Read and decode data bytes until we have at least `expected` bytes.
+    pub async fn read_all_data(&mut self, expected: usize, timeout: Duration) -> Vec<u8> {
+        let mut buf = [0u8; 8192];
+        let mut decoded = Vec::new();
+        let deadline = tokio::time::Instant::now() + timeout;
+
+        while decoded.len() < expected {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, self.stream.read(&mut buf)).await {
+                Ok(Ok(n)) if n > 0 => {
+                    let events = self.parser.feed_bytes(&buf[..n]);
+                    for event in events {
+                        if let ParseEvent::DataByte(b) = event {
+                            decoded.push(b);
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+        decoded
+    }
+
+    /// Send a protocol-encoded control message to the server.
+    pub async fn send_control(&mut self, msg: &ControlMessage) {
+        let encoded = encode_control(msg);
+        self.stream.write_all(&encoded).await.expect("send_control failed");
+    }
+
+    /// Read until a response message is received (timeout-protected).
     pub async fn read_response(&mut self, timeout: Duration) -> Option<String> {
         let mut buf = [0u8; 8192];
         let deadline = tokio::time::Instant::now() + timeout;

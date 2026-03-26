@@ -1,7 +1,6 @@
 use regex::Regex;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::protocol::{encode_control, encode_data, ControlMessage, MessageKind, ParseEvent, Parser};
 
@@ -9,7 +8,7 @@ use crate::protocol::{encode_control, encode_data, ControlMessage, MessageKind, 
 ///
 /// Returns the collected output as a string.
 pub async fn run_command(
-    stream: &mut UnixStream,
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin + Send),
     send: Option<&str>,
     collect_secs: Option<f64>,
     wait_for: Option<&str>,
@@ -117,6 +116,7 @@ pub async fn run_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::UnixStream;
 
     #[tokio::test]
     async fn command_mode_timeout() {
@@ -189,6 +189,53 @@ mod tests {
         assert!(output.contains("READY"));
         // Should have completed well before the 5-second timeout
         assert!(start.elapsed() < Duration::from_secs(2));
+
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn command_mode_over_tcp() {
+        let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp_listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let (mut server, _) = tcp_listener.accept().await.unwrap();
+            server.write_all(b"hello\r\n").await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let output = run_command(&mut client, None, Some(0.2), None, false).await.unwrap();
+        assert!(output.contains("hello"));
+
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn command_mode_send_and_collect_over_tcp() {
+        let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp_listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let (mut server, _) = tcp_listener.accept().await.unwrap();
+            let mut buf = [0u8; 256];
+            let n = server.read(&mut buf).await.unwrap();
+            assert!(n > 0);
+            server.write_all(b"OK\r\n").await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let output = run_command(
+            &mut client,
+            Some("AT\r\n"),
+            Some(0.3),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(output.contains("OK"));
 
         server_task.abort();
     }
