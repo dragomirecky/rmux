@@ -421,6 +421,93 @@ async fn history_empty_when_no_log() {
     assert!(result.is_err(), "reading nonexistent log should return an error");
 }
 
+#[tokio::test]
+async fn since_pattern_from_log() {
+    let server = TestServer::start_with_logging("since_basic").await;
+    let log_path = server.log_path.clone().expect("log_path should be set");
+
+    // Send several lines including a boot marker
+    server.mock_serial.write(b"init stuff\n").await.unwrap();
+    server
+        .mock_serial
+        .write(b"U-Boot 2024.01\n")
+        .await
+        .unwrap();
+    server
+        .mock_serial
+        .write(b"Loading kernel\n")
+        .await
+        .unwrap();
+    server.mock_serial.write(b"Started\n").await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let tmp_dir = server.stop_keep_files().await;
+
+    let re = regex::Regex::new("U-Boot").unwrap();
+    let lines = log_reader::read_lines_since_pattern(&log_path, &re).unwrap();
+    assert_eq!(lines.len(), 3);
+
+    let stripped: Vec<&str> = lines.iter().map(|l| log_reader::strip_timestamp(l)).collect();
+    assert_eq!(stripped, vec!["U-Boot 2024.01", "Loading kernel", "Started"]);
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[tokio::test]
+async fn since_pattern_multiple_boots() {
+    let server = TestServer::start_with_logging("since_multi").await;
+    let log_path = server.log_path.clone().expect("log_path should be set");
+
+    // First boot sequence
+    server
+        .mock_serial
+        .write(b"U-Boot 2024.01\n")
+        .await
+        .unwrap();
+    server.mock_serial.write(b"first boot\n").await.unwrap();
+
+    // Second boot sequence
+    server
+        .mock_serial
+        .write(b"U-Boot 2024.01\n")
+        .await
+        .unwrap();
+    server.mock_serial.write(b"second boot\n").await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let tmp_dir = server.stop_keep_files().await;
+
+    let re = regex::Regex::new("U-Boot").unwrap();
+    let lines = log_reader::read_lines_since_pattern(&log_path, &re).unwrap();
+
+    // Should only get lines from the LAST boot
+    let stripped: Vec<&str> = lines.iter().map(|l| log_reader::strip_timestamp(l)).collect();
+    assert_eq!(stripped, vec!["U-Boot 2024.01", "second boot"]);
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[tokio::test]
+async fn since_pattern_no_match_in_log() {
+    let server = TestServer::start_with_logging("since_nomatch").await;
+    let log_path = server.log_path.clone().expect("log_path should be set");
+
+    server
+        .mock_serial
+        .write(b"some data\nmore data\n")
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let tmp_dir = server.stop_keep_files().await;
+
+    let re = regex::Regex::new("NONEXISTENT").unwrap();
+    let lines = log_reader::read_lines_since_pattern(&log_path, &re).unwrap();
+    assert!(lines.is_empty(), "should return empty when no match");
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
 // ---------------------------------------------------------------------------
 // TCP transport tests
 // ---------------------------------------------------------------------------

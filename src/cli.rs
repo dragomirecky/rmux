@@ -109,8 +109,12 @@ pub struct ClientArgs {
     pub wait_for: Option<String>,
 
     /// Show last N lines of history on connect
-    #[arg(short = 'n', long)]
-    pub history: Option<usize>,
+    #[arg(short = 'n', long, conflicts_with = "since")]
+    pub last: Option<usize>,
+
+    /// Show history from last line matching this regex
+    #[arg(short = 's', long, conflicts_with = "last")]
+    pub since: Option<String>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -243,11 +247,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_client_with_history() {
-        let cli = Cli::parse_from(["rmux", "client", "test1", "--history", "50"]);
+    fn parse_client_with_last() {
+        let cli = Cli::parse_from(["rmux", "client", "test1", "--last", "50"]);
         match cli.command {
             Command::Client(args) => {
-                assert_eq!(args.history, Some(50));
+                assert_eq!(args.last, Some(50));
             }
             _ => panic!("expected Client command"),
         }
@@ -262,11 +266,40 @@ mod tests {
             Command::Client(args) => {
                 assert_eq!(args.command.as_deref(), Some("hello"));
                 assert_eq!(args.timeout, Some(3.0));
-                assert_eq!(args.history, Some(10));
+                assert_eq!(args.last, Some(10));
                 assert!(args.timestamps);
             }
             _ => panic!("expected Client command"),
         }
+    }
+
+    #[test]
+    fn parse_client_with_since() {
+        let cli = Cli::parse_from(["rmux", "client", "test1", "--since", "U-Boot"]);
+        match cli.command {
+            Command::Client(args) => {
+                assert_eq!(args.since.as_deref(), Some("U-Boot"));
+            }
+            _ => panic!("expected Client command"),
+        }
+    }
+
+    #[test]
+    fn parse_client_since_short_flag() {
+        let cli = Cli::parse_from(["rmux", "client", "test1", "-s", "ERROR"]);
+        match cli.command {
+            Command::Client(args) => {
+                assert_eq!(args.since.as_deref(), Some("ERROR"));
+            }
+            _ => panic!("expected Client command"),
+        }
+    }
+
+    #[test]
+    fn parse_client_since_and_last_conflict() {
+        let result =
+            Cli::try_parse_from(["rmux", "client", "test1", "--last", "10", "--since", "boot"]);
+        assert!(result.is_err(), "should reject --last combined with --since");
     }
 
     #[test]

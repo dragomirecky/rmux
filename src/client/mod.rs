@@ -10,6 +10,14 @@ use tokio::net::UnixStream;
 
 /// Run the client with the given arguments.
 pub async fn run_client(args: ClientArgs) -> anyhow::Result<()> {
+    // Validate --since regex early (before connecting)
+    let since_pattern = args
+        .since
+        .as_deref()
+        .map(regex::Regex::new)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("invalid regex for --since: {e}"))?;
+
     let socket_path = runtime::socket_path(&args.name);
     if !socket_path.exists() {
         anyhow::bail!(
@@ -33,7 +41,8 @@ pub async fn run_client(args: ClientArgs) -> anyhow::Result<()> {
     };
 
     // Show history from log file if requested
-    if let Some(n) = args.history {
+    let history_requested = args.last.is_some() || since_pattern.is_some();
+    if history_requested {
         let log_path = match state::read_state_file(&args.name) {
             Ok(state_file) => state_file.log_file.map(std::path::PathBuf::from),
             Err(e) => {
@@ -53,7 +62,18 @@ pub async fn run_client(args: ClientArgs) -> anyhow::Result<()> {
                 );
             }
             Some(ref path) => {
-                let lines = crate::log_reader::read_last_lines(path, n)?;
+                let lines = if let Some(n) = args.last {
+                    crate::log_reader::read_last_lines(path, n)?
+                } else if let Some(ref pattern) = since_pattern {
+                    crate::log_reader::read_lines_since_pattern(path, pattern)?
+                } else {
+                    unreachable!()
+                };
+
+                if lines.is_empty() && since_pattern.is_some() {
+                    eprintln!("no lines matched the --since pattern");
+                }
+
                 for line in &lines {
                     if timestamps {
                         println!("{line}");

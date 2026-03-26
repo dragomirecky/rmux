@@ -1,6 +1,6 @@
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use rmux::protocol::{
@@ -13,8 +13,18 @@ use rmux::server::serial;
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore, OwnedSemaphorePermit};
 use tokio_util::sync::CancellationToken;
+
+/// Cap concurrent PTY allocations to avoid exhausting the OS PTY limit
+/// when many tests run in parallel.
+static PTY_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+fn pty_semaphore() -> Arc<Semaphore> {
+    PTY_SEMAPHORE
+        .get_or_init(|| Arc::new(Semaphore::new(8)))
+        .clone()
+}
 
 // ---------------------------------------------------------------------------
 // AsyncFd I/O adapters for PTY file descriptors
@@ -209,6 +219,8 @@ pub struct TestServer {
     pub log_path: Option<PathBuf>,
     cancel: CancellationToken,
     tmp_dir: PathBuf,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+    _pty_permit: OwnedSemaphorePermit,
 }
 
 impl TestServer {
@@ -217,6 +229,7 @@ impl TestServer {
     /// This assembles the server pipeline manually (broadcast, serial reader/writer,
     /// client acceptor) using generic I/O with PTY pairs, bypassing `open_serial()`.
     pub async fn start(name: &str) -> Self {
+        let permit = pty_semaphore().acquire_owned().await.unwrap();
         let (mock_serial, slave_reader, slave_writer) =
             MockSerial::new().expect("failed to create mock serial");
         let mock_serial = Arc::new(mock_serial);
@@ -234,18 +247,20 @@ impl TestServer {
         let (broadcast_tx, _broadcast_rx) = broadcaster::new_broadcast();
         let (serial_tx, serial_rx) = mpsc::channel::<Vec<u8>>(256);
 
+        let mut tasks = Vec::new();
+
         // Spawn serial reader (slave reader → broadcast)
         let reader_cancel = cancel.clone();
         let reader_broadcast = broadcast_tx.clone();
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             serial::run_serial_reader(slave_reader, reader_broadcast, reader_cancel).await;
-        });
+        }));
 
         // Spawn serial writer (mpsc → slave writer)
         let writer_cancel = cancel.clone();
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             serial::run_serial_writer(slave_writer, serial_rx, writer_cancel).await;
-        });
+        }));
 
         // Bind Unix socket
         let _ = std::fs::remove_file(&socket_path);
@@ -262,7 +277,7 @@ impl TestServer {
         // Client acceptor loop
         let acceptor_cancel = cancel.clone();
         let acceptor_cancel2 = cancel.clone();
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             loop {
                 tokio::select! {
                     () = acceptor_cancel.cancelled() => break,
@@ -288,7 +303,7 @@ impl TestServer {
                     }
                 }
             }
-        });
+        }));
 
         // Wait for socket to be connectable
         for _ in 0..100 {
@@ -304,6 +319,8 @@ impl TestServer {
             log_path: None,
             cancel,
             tmp_dir,
+            tasks,
+            _pty_permit: permit,
         }
     }
 
@@ -312,6 +329,7 @@ impl TestServer {
     /// The log writer subscribes to the broadcast channel so serial data
     /// is written to a log file in the temp directory.
     pub async fn start_with_logging(name: &str) -> Self {
+        let permit = pty_semaphore().acquire_owned().await.unwrap();
         let (mock_serial, slave_reader, slave_writer) =
             MockSerial::new().expect("failed to create mock serial");
         let mock_serial = Arc::new(mock_serial);
@@ -330,30 +348,32 @@ impl TestServer {
         let (broadcast_tx, _broadcast_rx) = broadcaster::new_broadcast();
         let (serial_tx, serial_rx) = mpsc::channel::<Vec<u8>>(256);
 
+        let mut tasks = Vec::new();
+
         // Spawn serial reader (slave reader → broadcast)
         let reader_cancel = cancel.clone();
         let reader_broadcast = broadcast_tx.clone();
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             serial::run_serial_reader(slave_reader, reader_broadcast, reader_cancel).await;
-        });
+        }));
 
         // Spawn serial writer (mpsc → slave writer)
         let writer_cancel = cancel.clone();
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             serial::run_serial_writer(slave_writer, serial_rx, writer_cancel).await;
-        });
+        }));
 
         // Spawn log writer
         let log_rx = broadcast_tx.subscribe();
         let log_cancel = cancel.clone();
         let log_path_clone = log_path.clone();
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             if let Err(e) =
                 rmux::server::log_writer::run_log_writer(log_path_clone, log_rx, log_cancel).await
             {
                 tracing::error!("log writer error: {e}");
             }
-        });
+        }));
 
         // Bind Unix socket
         let _ = std::fs::remove_file(&socket_path);
@@ -370,7 +390,7 @@ impl TestServer {
         // Client acceptor loop
         let acceptor_cancel = cancel.clone();
         let acceptor_cancel2 = cancel.clone();
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             loop {
                 tokio::select! {
                     () = acceptor_cancel.cancelled() => break,
@@ -396,7 +416,7 @@ impl TestServer {
                     }
                 }
             }
-        });
+        }));
 
         // Wait for socket to be connectable
         for _ in 0..100 {
@@ -412,25 +432,34 @@ impl TestServer {
             log_path: Some(log_path),
             cancel,
             tmp_dir,
+            tasks,
+            _pty_permit: permit,
+        }
+    }
+
+    /// Wait for all spawned tasks to finish, ensuring PTY fds are released.
+    async fn join_tasks(self) {
+        self.cancel.cancel();
+        for task in self.tasks {
+            let _ = task.await;
         }
     }
 
     /// Stop the server and clean up temp files.
     pub async fn stop(self) {
-        self.cancel.cancel();
-        // Give tasks time to wind down
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let _ = std::fs::remove_file(&self.socket_path);
-        let _ = std::fs::remove_dir_all(&self.tmp_dir);
+        let socket_path = self.socket_path.clone();
+        let tmp_dir = self.tmp_dir.clone();
+        self.join_tasks().await;
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
     /// Stop the server but keep temp files (for reading logs after shutdown).
     /// Returns the temp directory path so the caller can clean up later.
     pub async fn stop_keep_files(self) -> PathBuf {
-        self.cancel.cancel();
-        // Give tasks time to wind down (log writer flushes on cancel)
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        self.tmp_dir
+        let tmp_dir = self.tmp_dir.clone();
+        self.join_tasks().await;
+        tmp_dir
     }
 }
 
