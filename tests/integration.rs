@@ -1364,3 +1364,278 @@ async fn tcp_listener_coexists_with_unix() {
 
     server.stop().await;
 }
+
+// ---------------------------------------------------------------------------
+// Remote history tests (TCP client + logging)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn tcp_client_history_last_lines() {
+    let server = TestServer::start_with_tcp_and_logging("tcp_hist_last").await;
+    let tcp_addr = server.tcp_listen_addr.expect("should have TCP addr");
+
+    // Send data through mock serial
+    server.mock_serial.write(b"alpha\n").await.unwrap();
+    server.mock_serial.write(b"beta\n").await.unwrap();
+    server.mock_serial.write(b"gamma\n").await.unwrap();
+
+    // Wait for log writer to flush
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Connect TCP client and request last 2 lines
+    let mut client = TcpTestClient::connect(tcp_addr).await;
+    client
+        .send_control(&ControlMessage::History {
+            lines: 2,
+            timestamps: false,
+            since: None,
+        })
+        .await;
+
+    let (data, responses) = client.read_data_and_responses(TIMEOUT).await;
+
+    assert!(data.contains("beta"), "expected 'beta' in: {data}");
+    assert!(data.contains("gamma"), "expected 'gamma' in: {data}");
+    assert!(!data.contains("alpha"), "should not contain 'alpha': {data}");
+    assert!(
+        responses.iter().any(|r| r["event"] == "history_end"),
+        "should have history_end event"
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn tcp_client_history_with_timestamps() {
+    let server = TestServer::start_with_tcp_and_logging("tcp_hist_ts").await;
+    let tcp_addr = server.tcp_listen_addr.expect("should have TCP addr");
+
+    server.mock_serial.write(b"stamped line\n").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut client = TcpTestClient::connect(tcp_addr).await;
+    client
+        .send_control(&ControlMessage::History {
+            lines: 10,
+            timestamps: true,
+            since: None,
+        })
+        .await;
+
+    let (data, responses) = client.read_data_and_responses(TIMEOUT).await;
+
+    // Should contain timestamp prefix
+    assert!(
+        data.contains("] stamped line"),
+        "should have timestamp prefix: {data}"
+    );
+    assert!(data.contains("[20"), "should have year in timestamp: {data}");
+    assert!(
+        responses.iter().any(|r| r["event"] == "history_end"),
+        "should have history_end event"
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn tcp_client_history_strips_timestamps() {
+    let server = TestServer::start_with_tcp_and_logging("tcp_hist_strip").await;
+    let tcp_addr = server.tcp_listen_addr.expect("should have TCP addr");
+
+    server.mock_serial.write(b"naked line\n").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut client = TcpTestClient::connect(tcp_addr).await;
+    client
+        .send_control(&ControlMessage::History {
+            lines: 10,
+            timestamps: false,
+            since: None,
+        })
+        .await;
+
+    let (data, responses) = client.read_data_and_responses(TIMEOUT).await;
+
+    assert!(data.contains("naked line"), "should contain the line: {data}");
+    assert!(
+        !data.contains("[20"),
+        "timestamps should be stripped: {data}"
+    );
+    assert!(responses.iter().any(|r| r["event"] == "history_end"));
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn tcp_client_history_since_pattern() {
+    let server = TestServer::start_with_tcp_and_logging("tcp_hist_since").await;
+    let tcp_addr = server.tcp_listen_addr.expect("should have TCP addr");
+
+    server.mock_serial.write(b"init stuff\n").await.unwrap();
+    server
+        .mock_serial
+        .write(b"U-Boot 2024.01\n")
+        .await
+        .unwrap();
+    server
+        .mock_serial
+        .write(b"Loading kernel\n")
+        .await
+        .unwrap();
+    server.mock_serial.write(b"Started\n").await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut client = TcpTestClient::connect(tcp_addr).await;
+    client
+        .send_control(&ControlMessage::History {
+            lines: 0,
+            timestamps: false,
+            since: Some("U-Boot".into()),
+        })
+        .await;
+
+    let (data, responses) = client.read_data_and_responses(TIMEOUT).await;
+
+    assert!(
+        data.contains("U-Boot 2024.01"),
+        "should contain boot marker: {data}"
+    );
+    assert!(
+        data.contains("Loading kernel"),
+        "should contain lines after marker: {data}"
+    );
+    assert!(data.contains("Started"), "should contain Started: {data}");
+    assert!(
+        !data.contains("init stuff"),
+        "should not contain lines before marker: {data}"
+    );
+    assert!(responses.iter().any(|r| r["event"] == "history_end"));
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn tcp_client_history_since_no_match() {
+    let server = TestServer::start_with_tcp_and_logging("tcp_hist_nomatch").await;
+    let tcp_addr = server.tcp_listen_addr.expect("should have TCP addr");
+
+    server
+        .mock_serial
+        .write(b"some data\nmore data\n")
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut client = TcpTestClient::connect(tcp_addr).await;
+    client
+        .send_control(&ControlMessage::History {
+            lines: 0,
+            timestamps: false,
+            since: Some("NONEXISTENT".into()),
+        })
+        .await;
+
+    let (data, responses) = client.read_data_and_responses(TIMEOUT).await;
+
+    // No data lines, just history_end
+    assert!(
+        data.is_empty() || !data.contains("some data"),
+        "should have no matching data: {data}"
+    );
+    assert!(responses.iter().any(|r| r["event"] == "history_end"));
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn tcp_client_history_no_log() {
+    let server = TestServer::start_with_tcp("th_nolog").await;
+    let tcp_addr = server.tcp_listen_addr.expect("should have TCP addr");
+
+    let mut client = TcpTestClient::connect(tcp_addr).await;
+    client
+        .send_control(&ControlMessage::History {
+            lines: 10,
+            timestamps: false,
+            since: None,
+        })
+        .await;
+
+    let response = client.read_response(TIMEOUT).await;
+    assert!(response.is_some());
+    let json: serde_json::Value = serde_json::from_str(&response.unwrap()).unwrap();
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap()
+            .contains("logging is not enabled"),
+        "expected logging error: {json}"
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn tcp_client_history_then_live_data() {
+    let server = TestServer::start_with_tcp_and_logging("tcp_hist_live").await;
+    let tcp_addr = server.tcp_listen_addr.expect("should have TCP addr");
+
+    server.mock_serial.write(b"old data\n").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut client = TcpTestClient::connect(tcp_addr).await;
+    client
+        .send_control(&ControlMessage::History {
+            lines: 10,
+            timestamps: false,
+            since: None,
+        })
+        .await;
+
+    // Read history
+    let (data, responses) = client.read_data_and_responses(TIMEOUT).await;
+    assert!(data.contains("old data"), "should contain history: {data}");
+    assert!(responses.iter().any(|r| r["event"] == "history_end"));
+
+    // Now inject new live data and verify it arrives on the same connection
+    server
+        .mock_serial
+        .write(b"live data")
+        .await
+        .unwrap();
+    let live = client.read_data(TIMEOUT).await;
+    assert_eq!(live, b"live data");
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn tcp_client_history_invalid_regex() {
+    let server = TestServer::start_with_tcp_and_logging("tcp_hist_badre").await;
+    let tcp_addr = server.tcp_listen_addr.expect("should have TCP addr");
+
+    server.mock_serial.write(b"data\n").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut client = TcpTestClient::connect(tcp_addr).await;
+    client
+        .send_control(&ControlMessage::History {
+            lines: 0,
+            timestamps: false,
+            since: Some("[invalid".into()),
+        })
+        .await;
+
+    let response = client.read_response(TIMEOUT).await;
+    assert!(response.is_some());
+    let json: serde_json::Value = serde_json::from_str(&response.unwrap()).unwrap();
+    let error = json["error"].as_str().unwrap();
+    assert!(
+        error.contains("invalid regex"),
+        "expected regex error, got: {error}"
+    );
+
+    server.stop().await;
+}

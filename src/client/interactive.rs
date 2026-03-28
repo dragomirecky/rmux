@@ -237,6 +237,14 @@ pub async fn run_interactive_socket(
                                 kind: MessageKind::Response,
                                 json,
                             } => {
+                                // Suppress internal history_end events
+                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
+                                    if v.get("event").and_then(|v| v.as_str())
+                                        == Some("history_end")
+                                    {
+                                        continue;
+                                    }
+                                }
                                 let msg = format!("\r\n[server: {json}]\r\n");
                                 if incoming_tx.send(msg.into_bytes()).await.is_err() {
                                     return;

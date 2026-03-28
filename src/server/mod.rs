@@ -138,6 +138,7 @@ pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
         baudrate: config.baudrate,
         serial_connected: true,
         client_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        log_file: log_path.clone(),
     });
 
     // Open transport and split for reader/writer

@@ -3,9 +3,10 @@ pub mod interactive;
 
 use std::io::IsTerminal;
 
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use crate::cli::ClientArgs;
+use crate::protocol::{encode_control, ControlMessage};
 use crate::runtime;
 use crate::server::state;
 
@@ -31,14 +32,20 @@ pub async fn run_client(args: ClientArgs) -> anyhow::Result<()> {
 
     if let Some(ref remote_addr) = args.remote {
         // TCP remote connection
-        let stream = tokio::net::TcpStream::connect(remote_addr)
+        let mut stream = tokio::net::TcpStream::connect(remote_addr)
             .await
             .map_err(|e| anyhow::anyhow!("failed to connect to remote server {remote_addr}: {e}"))?;
         tracing::info!("connected to remote server '{}' at {}", args.name, remote_addr);
 
-        // History is not available for remote connections
+        // Request history from the server if --last or --since is specified
         if args.last.is_some() || since_pattern.is_some() {
-            eprintln!("history is not available for remote connections");
+            let history_msg = ControlMessage::History {
+                lines: args.last.unwrap_or(50),
+                timestamps,
+                since: args.since.clone(),
+            };
+            let encoded = encode_control(&history_msg);
+            stream.write_all(&encoded).await?;
         }
 
         run_client_on_stream(stream, &args, timestamps).await

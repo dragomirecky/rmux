@@ -4,8 +4,8 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::protocol::{
-    encode_data, encode_response, ControlMessage, ErrorResponse, MessageKind, ParseEvent, Parser,
-    ResponseMessage, ServerInfoResponse,
+    encode_data, encode_response, ControlMessage, ErrorResponse, EventResponse, MessageKind,
+    ParseEvent, Parser, ResponseMessage, ServerInfoResponse,
 };
 
 /// Shared server state that client handlers can query.
@@ -14,6 +14,7 @@ pub struct ClientContext {
     pub baudrate: u32,
     pub serial_connected: bool,
     pub client_count: Arc<std::sync::atomic::AtomicUsize>,
+    pub log_file: Option<std::path::PathBuf>,
 }
 
 /// Handle a single client connection over any async stream (Unix socket or TCP).
@@ -149,10 +150,67 @@ fn handle_control_command(
             tracing::debug!("status requested");
             Some(encode_response(&resp))
         }
-        ControlMessage::History { lines, timestamps } => {
-            tracing::debug!("history requested: {lines} lines, timestamps={timestamps}");
-            // History would be served from the log file
-            None
+        ControlMessage::History {
+            lines,
+            timestamps,
+            since,
+        } => {
+            tracing::debug!(
+                "history requested: {lines} lines, timestamps={timestamps}, since={since:?}"
+            );
+
+            let log_path = match &ctx.log_file {
+                Some(p) if p.exists() => p,
+                Some(_) => {
+                    return Some(encode_response(&ResponseMessage::Error(ErrorResponse {
+                        error: "log file not found".into(),
+                    })));
+                }
+                None => {
+                    return Some(encode_response(&ResponseMessage::Error(ErrorResponse {
+                        error: "logging is not enabled on this server".into(),
+                    })));
+                }
+            };
+
+            let read_result = if let Some(ref pattern) = since {
+                match regex::Regex::new(pattern) {
+                    Ok(re) => crate::log_reader::read_lines_since_pattern(log_path, &re),
+                    Err(e) => {
+                        return Some(encode_response(&ResponseMessage::Error(ErrorResponse {
+                            error: format!("invalid regex: {e}"),
+                        })));
+                    }
+                }
+            } else {
+                crate::log_reader::read_last_lines(log_path, *lines)
+            };
+
+            let log_lines = match read_result {
+                Ok(lines) => lines,
+                Err(e) => {
+                    return Some(encode_response(&ResponseMessage::Error(ErrorResponse {
+                        error: format!("failed to read log: {e}"),
+                    })));
+                }
+            };
+
+            let mut response_bytes = Vec::new();
+            for line in &log_lines {
+                let display_line = if *timestamps {
+                    format!("{line}\r\n")
+                } else {
+                    format!("{}\r\n", crate::log_reader::strip_timestamp(line))
+                };
+                response_bytes.extend_from_slice(&encode_data(display_line.as_bytes()));
+            }
+
+            let end_event = ResponseMessage::Event(EventResponse {
+                event: "history_end".into(),
+            });
+            response_bytes.extend_from_slice(&encode_response(&end_event));
+
+            Some(response_bytes)
         }
         ControlMessage::Disconnect => {
             tracing::debug!("client requested disconnect");
@@ -185,7 +243,8 @@ mod tests {
             cmd,
             ControlMessage::History {
                 lines: 100,
-                timestamps: true
+                timestamps: true,
+                since: None,
             }
         );
     }
@@ -209,6 +268,7 @@ mod tests {
             baudrate: 115_200,
             serial_connected: true,
             client_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            log_file: None,
         };
         ctx.client_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -226,6 +286,7 @@ mod tests {
             baudrate: 115_200,
             serial_connected: true,
             client_count: Arc::new(std::sync::atomic::AtomicUsize::new(2)),
+            log_file: None,
         };
         let result = handle_control_command(&ControlMessage::Status, &ctx);
         assert!(result.is_some());
@@ -248,6 +309,7 @@ mod tests {
             baudrate: 115_200,
             serial_connected: true,
             client_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            log_file: None,
         };
         let result = handle_control_command(&ControlMessage::Unknown("foo".into()), &ctx);
         assert!(result.is_some());
@@ -255,6 +317,275 @@ mod tests {
         let json = std::str::from_utf8(&bytes[2..bytes.len() - 1]).unwrap();
         let value: serde_json::Value = serde_json::from_str(json).unwrap();
         assert_eq!(value["error"], "unknown command");
+    }
+
+    /// Helper: parse response bytes through the protocol parser, collecting
+    /// data bytes as a string and response JSON messages.
+    fn parse_history_response(bytes: &[u8]) -> (String, Vec<serde_json::Value>) {
+        use crate::protocol::{MessageKind, ParseEvent, Parser};
+        let mut parser = Parser::new();
+        let events = parser.feed_bytes(bytes);
+        let mut data = Vec::new();
+        let mut responses = Vec::new();
+        for event in events {
+            match event {
+                ParseEvent::DataByte(b) => data.push(b),
+                ParseEvent::Message {
+                    kind: MessageKind::Response,
+                    json,
+                } => {
+                    if let Ok(v) = serde_json::from_str(&json) {
+                        responses.push(v);
+                    }
+                }
+                _ => {}
+            }
+        }
+        (String::from_utf8_lossy(&data).into_owned(), responses)
+    }
+
+    #[test]
+    fn handle_control_history_no_log() {
+        let ctx = ClientContext {
+            port: "/dev/ttyUSB0".into(),
+            baudrate: 115_200,
+            serial_connected: true,
+            client_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            log_file: None,
+        };
+        let cmd = ControlMessage::History {
+            lines: 10,
+            timestamps: false,
+            since: None,
+        };
+        let result = handle_control_command(&cmd, &ctx);
+        assert!(result.is_some());
+        let (_, responses) = parse_history_response(&result.unwrap());
+        assert_eq!(responses.len(), 1);
+        assert_eq!(
+            responses[0]["error"],
+            "logging is not enabled on this server"
+        );
+    }
+
+    #[test]
+    fn handle_control_history_missing_file() {
+        let ctx = ClientContext {
+            port: "/dev/ttyUSB0".into(),
+            baudrate: 115_200,
+            serial_connected: true,
+            client_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            log_file: Some(std::path::PathBuf::from("/tmp/rmux_nonexistent_test.log")),
+        };
+        let cmd = ControlMessage::History {
+            lines: 10,
+            timestamps: false,
+            since: None,
+        };
+        let result = handle_control_command(&cmd, &ctx);
+        assert!(result.is_some());
+        let (_, responses) = parse_history_response(&result.unwrap());
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0]["error"], "log file not found");
+    }
+
+    #[test]
+    fn handle_control_history_returns_data() {
+        let dir = std::env::temp_dir().join(format!(
+            "rmux_hist_test_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_file = dir.join("test.log");
+        std::fs::write(
+            &log_file,
+            "[2024-01-01 12:00:00.000] alpha\n\
+             [2024-01-01 12:00:01.000] beta\n\
+             [2024-01-01 12:00:02.000] gamma\n",
+        )
+        .unwrap();
+
+        let ctx = ClientContext {
+            port: "/dev/ttyUSB0".into(),
+            baudrate: 115_200,
+            serial_connected: true,
+            client_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            log_file: Some(log_file),
+        };
+        let cmd = ControlMessage::History {
+            lines: 2,
+            timestamps: false,
+            since: None,
+        };
+        let result = handle_control_command(&cmd, &ctx);
+        assert!(result.is_some());
+        let (data, responses) = parse_history_response(&result.unwrap());
+
+        // Should contain last 2 lines, timestamps stripped
+        assert!(data.contains("beta"), "expected 'beta' in: {data}");
+        assert!(data.contains("gamma"), "expected 'gamma' in: {data}");
+        assert!(!data.contains("alpha"), "should not contain 'alpha': {data}");
+        assert!(
+            !data.contains("[2024"),
+            "timestamps should be stripped: {data}"
+        );
+
+        // Should end with history_end event
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0]["event"], "history_end");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn handle_control_history_with_timestamps() {
+        let dir = std::env::temp_dir().join(format!(
+            "rmux_hist_ts_test_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_file = dir.join("test.log");
+        std::fs::write(
+            &log_file,
+            "[2024-01-01 12:00:00.000] hello\n",
+        )
+        .unwrap();
+
+        let ctx = ClientContext {
+            port: "/dev/ttyUSB0".into(),
+            baudrate: 115_200,
+            serial_connected: true,
+            client_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            log_file: Some(log_file),
+        };
+        let cmd = ControlMessage::History {
+            lines: 10,
+            timestamps: true,
+            since: None,
+        };
+        let result = handle_control_command(&cmd, &ctx);
+        assert!(result.is_some());
+        let (data, responses) = parse_history_response(&result.unwrap());
+
+        assert!(
+            data.contains("[2024-01-01 12:00:00.000]"),
+            "timestamps should be preserved: {data}"
+        );
+        assert!(data.contains("hello"));
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0]["event"], "history_end");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn handle_control_history_since() {
+        let dir = std::env::temp_dir().join(format!(
+            "rmux_hist_since_test_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_file = dir.join("test.log");
+        std::fs::write(
+            &log_file,
+            "[2024-01-01 12:00:00.000] init\n\
+             [2024-01-01 12:00:01.000] BOOT MARKER\n\
+             [2024-01-01 12:00:02.000] running\n",
+        )
+        .unwrap();
+
+        let ctx = ClientContext {
+            port: "/dev/ttyUSB0".into(),
+            baudrate: 115_200,
+            serial_connected: true,
+            client_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            log_file: Some(log_file),
+        };
+        let cmd = ControlMessage::History {
+            lines: 0,
+            timestamps: false,
+            since: Some("BOOT MARKER".into()),
+        };
+        let result = handle_control_command(&cmd, &ctx);
+        assert!(result.is_some());
+        let (data, responses) = parse_history_response(&result.unwrap());
+
+        assert!(data.contains("BOOT MARKER"), "should contain marker: {data}");
+        assert!(data.contains("running"), "should contain lines after marker: {data}");
+        assert!(!data.contains("init"), "should not contain lines before marker: {data}");
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0]["event"], "history_end");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn handle_control_history_invalid_regex() {
+        let dir = std::env::temp_dir().join(format!(
+            "rmux_hist_badre_test_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_file = dir.join("test.log");
+        std::fs::write(&log_file, "line\n").unwrap();
+
+        let ctx = ClientContext {
+            port: "/dev/ttyUSB0".into(),
+            baudrate: 115_200,
+            serial_connected: true,
+            client_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            log_file: Some(log_file),
+        };
+        let cmd = ControlMessage::History {
+            lines: 0,
+            timestamps: false,
+            since: Some("[invalid".into()),
+        };
+        let result = handle_control_command(&cmd, &ctx);
+        assert!(result.is_some());
+        let (_, responses) = parse_history_response(&result.unwrap());
+        assert_eq!(responses.len(), 1);
+        let error = responses[0]["error"].as_str().unwrap();
+        assert!(
+            error.contains("invalid regex"),
+            "expected regex error, got: {error}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn handle_control_history_since_no_match() {
+        let dir = std::env::temp_dir().join(format!(
+            "rmux_hist_nomatch_test_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_file = dir.join("test.log");
+        std::fs::write(&log_file, "alpha\nbeta\n").unwrap();
+
+        let ctx = ClientContext {
+            port: "/dev/ttyUSB0".into(),
+            baudrate: 115_200,
+            serial_connected: true,
+            client_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            log_file: Some(log_file),
+        };
+        let cmd = ControlMessage::History {
+            lines: 0,
+            timestamps: false,
+            since: Some("NONEXISTENT".into()),
+        };
+        let result = handle_control_command(&cmd, &ctx);
+        assert!(result.is_some());
+        let (data, responses) = parse_history_response(&result.unwrap());
+
+        // No data, just history_end
+        assert!(data.is_empty(), "should have no data: {data}");
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0]["event"], "history_end");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -268,6 +599,7 @@ mod tests {
             baudrate: 115_200,
             serial_connected: true,
             client_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            log_file: None,
         });
         let cancel = CancellationToken::new();
 
@@ -325,6 +657,7 @@ mod tests {
             baudrate: 115_200,
             serial_connected: true,
             client_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            log_file: None,
         });
         let cancel = CancellationToken::new();
 
@@ -368,6 +701,7 @@ mod tests {
             baudrate: 115_200,
             serial_connected: true,
             client_count: client_count.clone(),
+            log_file: None,
         });
         let cancel = CancellationToken::new();
 
@@ -402,6 +736,7 @@ mod tests {
             baudrate: 115_200,
             serial_connected: true,
             client_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            log_file: None,
         });
         let cancel = CancellationToken::new();
 
@@ -459,6 +794,7 @@ mod tests {
             baudrate: 115_200,
             serial_connected: true,
             client_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            log_file: None,
         });
         let cancel = CancellationToken::new();
 
@@ -503,6 +839,7 @@ mod tests {
             baudrate: 115_200,
             serial_connected: true,
             client_count: client_count.clone(),
+            log_file: None,
         });
         let cancel = CancellationToken::new();
 

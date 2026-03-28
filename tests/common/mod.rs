@@ -273,6 +273,7 @@ impl TestServer {
             baudrate: 115_200,
             serial_connected: true,
             client_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            log_file: None,
         });
 
         // Client acceptor loop
@@ -371,6 +372,7 @@ impl TestServer {
             baudrate: 115_200,
             serial_connected: true,
             client_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            log_file: None,
         });
 
         // Dual-accept loop (Unix + TCP)
@@ -505,6 +507,7 @@ impl TestServer {
             baudrate: 115_200,
             serial_connected: true,
             client_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            log_file: Some(log_path.clone()),
         });
 
         // Client acceptor loop
@@ -551,6 +554,138 @@ impl TestServer {
             mock_serial,
             log_path: Some(log_path),
             tcp_listen_addr: None,
+            cancel,
+            tmp_dir,
+            tasks,
+            _pty_permit: permit,
+        }
+    }
+
+    /// Start a test server with both TCP client listener and logging enabled.
+    pub async fn start_with_tcp_and_logging(name: &str) -> Self {
+        let permit = pty_semaphore().acquire_owned().await.unwrap();
+        let (mock_serial, slave_reader, slave_writer) =
+            MockSerial::new().expect("failed to create mock serial");
+        let mock_serial = Arc::new(mock_serial);
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "rmux_tl_{}_{name}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let socket_path = tmp_dir.join(format!("{name}.sock"));
+        let log_path = tmp_dir.join(format!("{name}.log"));
+
+        let cancel = CancellationToken::new();
+
+        let (broadcast_tx, _broadcast_rx) = broadcaster::new_broadcast();
+        let (serial_tx, serial_rx) = mpsc::channel::<Vec<u8>>(256);
+
+        let mut tasks = Vec::new();
+
+        let reader_cancel = cancel.clone();
+        let reader_broadcast = broadcast_tx.clone();
+        tasks.push(tokio::spawn(async move {
+            serial::run_serial_reader(slave_reader, reader_broadcast, reader_cancel).await;
+        }));
+
+        let writer_cancel = cancel.clone();
+        tasks.push(tokio::spawn(async move {
+            serial::run_serial_writer(slave_writer, serial_rx, writer_cancel).await;
+        }));
+
+        // Spawn log writer
+        let log_rx = broadcast_tx.subscribe();
+        let log_cancel = cancel.clone();
+        let log_path_clone = log_path.clone();
+        tasks.push(tokio::spawn(async move {
+            if let Err(e) =
+                rmux::server::log_writer::run_log_writer(log_path_clone, log_rx, log_cancel).await
+            {
+                tracing::error!("log writer error: {e}");
+            }
+        }));
+
+        // Bind Unix socket
+        let _ = std::fs::remove_file(&socket_path);
+        let unix_listener = UnixListener::bind(&socket_path).unwrap();
+
+        // Bind TCP listener
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_addr = tcp_listener.local_addr().unwrap();
+
+        let ctx = Arc::new(ClientContext {
+            port: "/dev/mock".into(),
+            baudrate: 115_200,
+            serial_connected: true,
+            client_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            log_file: Some(log_path.clone()),
+        });
+
+        // Dual-accept loop (Unix + TCP)
+        let acceptor_cancel = cancel.clone();
+        let acceptor_cancel2 = cancel.clone();
+        tasks.push(tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = acceptor_cancel.cancelled() => break,
+                    result = unix_listener.accept() => {
+                        match result {
+                            Ok((stream, _addr)) => {
+                                let client_broadcast = broadcast_tx.clone();
+                                let client_serial = serial_tx.clone();
+                                let client_ctx = ctx.clone();
+                                let client_cancel = acceptor_cancel2.clone();
+                                tokio::spawn(async move {
+                                    client_handler::handle_client(
+                                        stream,
+                                        client_broadcast,
+                                        client_serial,
+                                        client_ctx,
+                                        client_cancel,
+                                    ).await;
+                                });
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    result = tcp_listener.accept() => {
+                        match result {
+                            Ok((stream, _addr)) => {
+                                let client_broadcast = broadcast_tx.clone();
+                                let client_serial = serial_tx.clone();
+                                let client_ctx = ctx.clone();
+                                let client_cancel = acceptor_cancel2.clone();
+                                tokio::spawn(async move {
+                                    client_handler::handle_client(
+                                        stream,
+                                        client_broadcast,
+                                        client_serial,
+                                        client_ctx,
+                                        client_cancel,
+                                    ).await;
+                                });
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+            }
+        }));
+
+        // Wait for socket to be connectable
+        for _ in 0..100 {
+            if UnixStream::connect(&socket_path).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        TestServer {
+            socket_path,
+            mock_serial,
+            log_path: Some(log_path),
+            tcp_listen_addr: Some(tcp_addr),
             cancel,
             tmp_dir,
             tasks,
@@ -674,6 +809,7 @@ impl TcpTestServer {
             baudrate: 0,
             serial_connected: true,
             client_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            log_file: None,
         });
 
         // Client acceptor loop
@@ -1004,5 +1140,57 @@ impl TcpTestClient {
                 _ => return None,
             }
         }
+    }
+
+    /// Read data bytes and response messages until a specific event response is
+    /// received or timeout expires. Returns (decoded_data_string, response_jsons).
+    pub async fn read_data_and_responses(
+        &mut self,
+        timeout: Duration,
+    ) -> (String, Vec<serde_json::Value>) {
+        let mut buf = [0u8; 8192];
+        let mut data = Vec::new();
+        let mut responses = Vec::new();
+        let deadline = tokio::time::Instant::now() + timeout;
+
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, self.stream.read(&mut buf)).await {
+                Ok(Ok(n)) if n > 0 => {
+                    let events = self.parser.feed_bytes(&buf[..n]);
+                    for event in events {
+                        match event {
+                            ParseEvent::DataByte(b) => data.push(b),
+                            ParseEvent::Message {
+                                kind: MessageKind::Response,
+                                json,
+                            } => {
+                                if let Ok(v) = serde_json::from_str(&json) {
+                                    let v: serde_json::Value = v;
+                                    let is_history_end = v
+                                        .get("event")
+                                        .and_then(|e| e.as_str())
+                                        == Some("history_end");
+                                    responses.push(v);
+                                    if is_history_end {
+                                        return (
+                                            String::from_utf8_lossy(&data).into_owned(),
+                                            responses,
+                                        );
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        (String::from_utf8_lossy(&data).into_owned(), responses)
     }
 }

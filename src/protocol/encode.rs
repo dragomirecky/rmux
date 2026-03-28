@@ -83,6 +83,7 @@ mod tests {
         let msg = ControlMessage::History {
             lines: 100,
             timestamps: true,
+            since: None,
         };
         let encoded = encode_control(&msg);
         assert_eq!(encoded[0], 0x00);
@@ -164,6 +165,7 @@ mod tests {
         let msg = ControlMessage::History {
             lines: 50,
             timestamps: false,
+            since: None,
         };
         let encoded = encode_control(&msg);
         let mut parser = Parser::new();

@@ -3,7 +3,11 @@ use serde::{Deserialize, Serialize};
 /// Control messages sent from client to server.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ControlMessage {
-    History { lines: usize, timestamps: bool },
+    History {
+        lines: usize,
+        timestamps: bool,
+        since: Option<String>,
+    },
     Status,
     Disconnect,
     Unknown(String),
@@ -63,7 +67,15 @@ impl ControlMessage {
                     .get("timestamps")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false);
-                ControlMessage::History { lines, timestamps }
+                let since = value
+                    .get("since")
+                    .and_then(serde_json::Value::as_str)
+                    .map(String::from);
+                ControlMessage::History {
+                    lines,
+                    timestamps,
+                    since,
+                }
             }
             Some("status") => ControlMessage::Status,
             Some("disconnect") => ControlMessage::Disconnect,
@@ -74,13 +86,20 @@ impl ControlMessage {
     /// Serialize this control message to JSON.
     pub fn to_json(&self) -> String {
         match self {
-            ControlMessage::History { lines, timestamps } => {
-                serde_json::json!({
+            ControlMessage::History {
+                lines,
+                timestamps,
+                since,
+            } => {
+                let mut obj = serde_json::json!({
                     "cmd": "history",
                     "lines": lines,
                     "timestamps": timestamps,
-                })
-                .to_string()
+                });
+                if let Some(ref s) = since {
+                    obj["since"] = serde_json::json!(s);
+                }
+                obj.to_string()
             }
             ControlMessage::Status => {
                 serde_json::json!({"cmd": "status"}).to_string()
@@ -104,7 +123,8 @@ mod tests {
             msg,
             ControlMessage::History {
                 lines: 50,
-                timestamps: false
+                timestamps: false,
+                since: None,
             }
         );
     }
@@ -116,9 +136,37 @@ mod tests {
             msg,
             ControlMessage::History {
                 lines: 50,
-                timestamps: false
+                timestamps: false,
+                since: None,
             }
         );
+    }
+
+    #[test]
+    fn parse_history_with_since() {
+        let msg = ControlMessage::from_json(
+            r#"{"cmd":"history","lines":50,"timestamps":false,"since":"U-Boot"}"#,
+        );
+        assert_eq!(
+            msg,
+            ControlMessage::History {
+                lines: 50,
+                timestamps: false,
+                since: Some("U-Boot".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn history_since_round_trip() {
+        let original = ControlMessage::History {
+            lines: 50,
+            timestamps: false,
+            since: Some("BOOT".into()),
+        };
+        let json = original.to_json();
+        let parsed = ControlMessage::from_json(&json);
+        assert_eq!(original, parsed);
     }
 
     #[test]
@@ -150,6 +198,7 @@ mod tests {
         let original = ControlMessage::History {
             lines: 100,
             timestamps: true,
+            since: None,
         };
         let json = original.to_json();
         let parsed = ControlMessage::from_json(&json);
